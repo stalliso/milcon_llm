@@ -3,7 +3,8 @@
 import fitz  # pymupdf
 from dataclasses import dataclass, asdict
 from typing import List, Dict, Any
-
+import os
+from pprint import pprint
 
 # Create custom data class that will represent pdf text boxes and custom parser object to extract those text boxes:
 #________________________________________________________________________________________________________________________
@@ -68,12 +69,20 @@ def get_inst(boxes:list)->str: # Installation
     text = boxes[6].text
     return text.splitlines()[0].lstrip()
 
-def get_CWE(boxes:list)->str: # Current Estimate
-    text = boxes[5].text
+def get_CWE(boxes:list)->int: # Current Estimate
+    idx = 0
+    for i in range(10):
+        if "CWE($K)".casefold() in boxes[i].text.casefold(): # Find line based on field name
+            idx = i
+    text = boxes[idx].text
     return int(text.replace("CWE($K):", "").replace(",", "").strip())
 
-def get_CCN(boxes:list) ->str: # Control Number
-    text = boxes[4].text
+def get_CCN(boxes:list) ->int: # Control Number
+    idx = 0
+    for i in range(10):
+        if "CCN".casefold() in boxes[i].text.casefold(): # Find line based on field name
+            idx = i
+    text = boxes[idx].text
     return int(text.replace("Project CCN:", "").strip())
 
 def get_regn(boxes:list) ->str: # Region
@@ -237,10 +246,55 @@ def ld_propt_urg_st(boxes:list)->dict: # Lead proponent urgency statement
 def get_pds(boxes:list)->dict:
     pds ={
         get_proj(boxes):{
+
+            # Top section of the form (metadata): 
             "title":get_title(boxes),
-            
+            "installation":get_inst(boxes),
+            "CWE":get_CWE(boxes),
+            "CCN":get_CCN(boxes),
+            "region":get_regn(boxes),
+            "lead_proponent":get_lead_propt(boxes),
+            "COCOM":get_cocom(boxes),
+            "scope":get_scope(boxes),
+            "impact_if_not_provided":get_imp(boxes),
+
+            # Scored fields:
+            "region_mission_alignment":regn_mis_algn(boxes),
+            "lead_proponent_mission_alignment":ld_propt_mis_algn(boxes),
+            "region_readiness_support":regn_rd_spt(boxes),
+            "lead_proponent_readiness_support":ld_propt_rd_spt(boxes),
+            "region_operational_cost":regn_op_cost(boxes),
+            "lead_proponent_operational_cost":ld_propt_op_cost(boxes),
+            "region_severity_statement":regn_sev_st(boxes),
+            "lead_proponent_severity_statement": ld_propt_sev_st(boxes),
+            "region_urgency_statement":regn_urg_st(boxes),
+            "lead_proponent_urgency_statement":ld_propt_urg_st(boxes)
         }
     }
+    return pds
 #________________________________________________________________________________________________________________________
+
+
+# Example usage:
+#________________________________________________________________________________________________________________________
+files = ["docs/project930.pdf", "docs/project942.pdf"]
+cwd = os.getcwd()
+file_paths = [os.path.join(cwd, file) for file in files]
+
+proj930 = FormTextExtractor(file_paths[0]).extract_boxes()
+proj942 = FormTextExtractor(file_paths[1]).extract_boxes()
+
+proj930_txt = get_pds(proj930)
+proj942_txt = get_pds(proj942)
+
+pprint(proj930_txt, width = 100)
+pprint(proj942_txt, width = 100)
+
+
+
+
+
+
+
 
 
