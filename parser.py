@@ -237,8 +237,45 @@ def ld_propt_urg_st(boxes:list)->dict: # Lead proponent urgency statement
         return {"description":description, "score":score}
     else:
         return {"description":None, "score":None}
+
 #________________________________________________________________________________________________________________________
 
+
+
+# Get the region/lead proponent metrics (RAC, ROI, PCI)
+#________________________________________________________________________________________________________________________
+# These are tricky and require some complex handling because all three appear on a single line of text or in a single text box. 
+# Sometimes, within the textbox, the value precedes the field name it corresponds to, sometimes it succeeds it, sometimes there is 
+# extra whitespace between the field name and value and sometimes they are left entirely blank.
+
+def rac_roi_pci(boxes: list)->dict:
+
+    fields = ["RAC:", "ROI:", "PCI:"]
+    results = {"RAC":None, "ROI":None, "PCI":None}
+
+    idx = 0
+    for i in range(35,46):
+        if "RAC:" in boxes[i].text:
+            tokens = [t.strip() for t in boxes[i].text.replace("\n", " ").split() if t.strip()]
+
+            current_field = None
+            pending_value = None
+            for tok in tokens:
+                if tok in fields:
+
+                    if pending_value is not None:
+                        results[tok[:-1]] = pending_value
+                        pending_value = None
+                    current_field = tok[:-1] # Get rid of colon
+
+                else:
+                    if current_field is None:
+                        pending_value = tok
+                    else:
+                        results[current_field] = tok
+                        current_field = None
+    return results
+#________________________________________________________________________________________________________________________
 
 
 # Apply functions in concert to get a consolidated Prject Data Sheet
@@ -268,7 +305,10 @@ def get_pds(boxes:list)->dict:
             "region_severity_statement":regn_sev_st(boxes),
             "lead_proponent_severity_statement": ld_propt_sev_st(boxes),
             "region_urgency_statement":regn_urg_st(boxes),
-            "lead_proponent_urgency_statement":ld_propt_urg_st(boxes)
+            "lead_proponent_urgency_statement":ld_propt_urg_st(boxes),
+
+            # Region/lead proponent metrics:
+            "metrics":rac_roi_pci(boxes)
         }
     }
     return pds
