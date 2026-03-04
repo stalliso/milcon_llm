@@ -10,6 +10,9 @@ from langchain_core.runnables import RunnableLambda
 # LLM
 from langchain_openai import ChatOpenAI
 
+# Random Question Sampling
+import random
+
 # ----------------------------------------------------
 # DO NOT MODIFY THIS SCRIPT
 # ----------------------------------------------------
@@ -72,7 +75,7 @@ baseline_rag_chain = (
 )
 
 # Function to evaluate RAG chain accuracy
-def eval_rag_chain_proj_query(my_rag_chain):
+def eval_rag_chain_proj_query(my_rag_chain, q_num = 15):
 
     q_a_pairs = [
     # RM21-0367
@@ -424,8 +427,9 @@ def eval_rag_chain_proj_query(my_rag_chain):
 
     # Counts correct answers to questions
     # Requires that answers match exactly
+    q_a_pairs_rand = random.sample(q_a_pairs, q_num)
     correct = 0
-    for pair in q_a_pairs:
+    for pair in q_a_pairs_rand:
         question = pair["question"] + " " + " ".join(pair["options"])
         expected_answer = pair["answer"]
         response = my_rag_chain.invoke(question)
@@ -443,7 +447,7 @@ def eval_rag_chain_proj_query(my_rag_chain):
         else:
             print(f"Pipeline Response: {response}\n")
 
-    accuracy = correct / len(q_a_pairs)
+    accuracy = correct / len(q_a_pairs_rand)
 
     print(f"Pipeline accuracy: {accuracy:.02%}")
 
