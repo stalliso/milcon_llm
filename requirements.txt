@@ -1,0 +1,9 @@
+streamlit
+polars[sqlalchemy]
+pandas
+altair
+openai
+SQLAlchemy
+connectorx
+tabulate
+pydeck
