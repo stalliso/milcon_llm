@@ -433,66 +433,53 @@ r_logger = RunnableLambda( logging_helper, name= "log chain state")
 # Provide instructions for the routing tool, and the available routes. See Lsn8 for example.
 # Instructions should be something like use this vectorstore for this, use that one for that, otherwise use...
 class RouteSelection(BaseModel):
-    """Route selection for query processing.
-
-    The project vectorstore contains project planning documents required for briefing a project or selectng a project for funding. 
-    contains all the necessary information for projects including, but not limited to, location, price, scope, impact if not provided, region, lead proponent, etc.
-    It also includes the region and lead proponent justification and scores for the main scoring categories of Mission Alignment, Readiness Support, Operational Cost, and Severity (sometimes Urgency as well).
-    The facility vectorstore contains the Commander, Naval Installation Command (CNIC) guidance for how to assess a project, including the criteria for each 0-4 score in the four voting categories.
-    The strategy vectorstore contains the National Security Strategy (NSS) and National Defense Strategy (NDS) applicable to the projects. 
-    The facility vectorstore consists of two vectorstores - one for POM26 (fac26_vectorstore), which is the original guidance, and one for POM28 (fac28_vectorstore), which is the updated guidance.
-    The strategy vectorstore consists of two vectorstores - one for POM26 (strat26_vectorstore), which is the original guidance, and one for POM28 (strat28_vectorstore), which is the updated guidance.
-    Use 'proj_vectorstore' for questions about specific projects.
-    Use 'strat26_vectorstore' for questions about strategy in POM26.
-    Use 'strat28_vectorstore' for questions about strategy in POM28.
-    Use 'both' for questions that ask how a project relates to or aligns with strategy/policy.
+    """Schema for selecting one or more relevant vectorstores.
     """
-    route: Literal["proj_vectorstore", "strat26_vectorstore", "strat28_vectorstore", "both"] = Field(
+    routes: List[Literal["proj_vectorstore", "strat26_vectorstore", "strat28_vectorstore"]] = Field(
         description="Selected route based on query type."
     )
 
 @tool(args_schema=RouteSelection)
-def select_route(route: str) -> str:
-    """Route user queries to the appropriate source.
-    The project vectorstore contains project planning documents required for briefing a project or selectng a project for funding. 
-    contains all the necessary information for projects including, but not limited to, location, price, scope, impact if not provided, region, lead proponent, etc.
-    It also includes the region and lead proponent justification and scores for the main scoring categories of Mission Alignment, Readiness Support, Operational Cost, and Severity (sometimes Urgency as well).
-    The strat26 vectorstore contains the National Security Strategy (NSS) and National Defense Strategy (NDS) applicable to the projects. It also contains the Commander, Naval Installation Command (CNIC) guidance for how to assess a project, including the criteria for each 0-4 score in the four voting categories.
-    The strat28 vectorstore contains the updated National Security Strategy (NSS) and National Defense Strategy (NDS) applicable to the projects. It also contains the updated Commander, Naval Installation Command (CNIC) guidance for how to assess a project, including the criteria for each 0-4 score in the four voting categories.
-    Use 'proj_vectorstore' for questions about specific projects.
-    Use 'strat26_vectorstore' for questions about strategy and facility criteria in POM26 or if asked about 'existing' project information.
-    Use 'strat28_vectorstore' for questions about strategy and facility criteria in POM28 or if asked to estimate a project based on 'new' or 'updated' guidance.
-    Use 'both' for questions that ask how a project relates to or aligns with strategy/policy.
+def select_route(routes: list[str]) -> list[str]:
+    """Return the list of vectorstores selected by the router.
     """
-    return route
+    return routes
 
 llm_router = llm_md_tools.bind_tools([select_route], tool_choice='select_route')
 
 # Router instructions
 router_prompt = ChatPromptTemplate.from_messages([
-    ("system", """You are a query routing assistant. Your job is to analyze user queries and route them to the appropriate source. 
+    ("system", """You are a routing assistant. Your task is to determine which document domains are relevant to the user’s query. 
+Return ALL applicable vectorstores as a list. Queries may require multiple domains.
 
-The project vectorstore contains project planning documents required for briefing a project or selectng a project for funding. 
-contains all the necessary information for projects including, but not limited to, location, price, scope, impact if not provided, region, lead proponent, etc.
-It also includes the region and lead proponent justification and scores for the main scoring categories of Mission Alignment, Readiness Support, Operational Cost, and Severity (sometimes Urgency as well).
-The strat26 vectorstore contains the National Security Strategy (NSS) and National Defense Strategy (NDS) applicable to the projects. It also contains the Commander, Naval Installation Command (CNIC) guidance for how to assess a project, including the criteria for each 0-4 score in the four voting categories.
-The strat28 vectorstore contains the updated National Security Strategy (NSS) and National Defense Strategy (NDS) applicable to the projects. It also contains the updated Commander, Naval Installation Command (CNIC) guidance for how to assess a project, including the criteria for each 0-4 score in the four voting categories.
-Use 'proj_vectorstore' for questions about specific projects.
-Use 'strat26_vectorstore' for questions about strategy and facility criteria in POM26 or if asked about 'existing' project information.
-Use 'strat28_vectorstore' for questions about strategy and facility criteria in POM28 or if asked to estimate a project based on 'new' or 'updated' guidance.
-Use 'both' for questions that ask how a project relates to or aligns with strategy/policy.
-     
-ROUTING RULES:
-Route to 'proj_vectorstore' for ANY question about a specific project ID 
-(e.g. P738, P222, RM16-0799, NF20-0826, ST18-1369, etc.) or project details 
-like CWE, capacity ratings, scores, facility age, or lead proponent.
-Route to 'strat26_vectorstore' for general POM26 National Security Strategy, National Defense Strategy, or facility criteria information.
-     Specifically, definitions for items on the Project Data Sheets (PDS), such as Mission Alignment, Readiness Support, Operational Cost, and Severity; or specifically pillars/themese of NDS/NSS.
-Route to 'strat28_vectorstore' for general POM28 National Security Strategy, National Defense Strategy, or facility criteria information.
-     Specifically, NEW definitions for items on the Project Data Sheets (PDS), such as Mission Alignment, Readiness Support, Operational Cost, and Severity; or specifically pillars/themese of NDS/NSS. 
-     This will be queried in the context of estimating an existing project based on NEW or UPDATED guidance, so use the strat28_vectorstore for this type of question.
-Route to 'both' for questions that ask how a project relates to or aligns with POM26 strategy/policy.
+DOMAIN DEFINITIONS
+- proj_vectorstore: Project datasheets and planning documents. Includes scope, cost, location, justification, 
+  scoring (Mission Alignment, Readiness Support, Operational Cost, Severity/Urgency), facility details, and 
+  proponent information.
 
+- strat26_vectorstore: POM26-era strategic guidance. Includes NSS/NDS themes, CNIC scoring criteria, and 
+  definitions for PDS scoring categories as they existed during POM26.
+
+- strat28_vectorstore: Updated POM28 strategic guidance. Includes revised NSS/NDS themes, updated CNIC scoring 
+  criteria, and new definitions for PDS scoring categories used for re-scoring or estimating projects under 
+  updated guidance.
+
+ROUTING RULES
+- Include proj_vectorstore for any query involving a specific project ID (e.g., P738, RM16-0799), project 
+  attributes, scoring, justification, or facility details.
+
+- Include strat26_vectorstore for questions about POM26 strategy, POM26 scoring definitions, or “existing” or 
+  “original” guidance.
+
+- Include strat28_vectorstore for questions about POM28 strategy, updated scoring definitions, or requests to 
+  estimate or reinterpret a project using “new,” “updated,” or “future” guidance.
+
+- If a query asks how a project aligns with strategy or policy, include BOTH the project vectorstore and the 
+  relevant strategy vectorstore(s).
+
+OUTPUT FORMAT
+Return a list of all relevant vectorstores, e.g.:
+["proj_vectorstore", "strat28_vectorstore"]
 
 """),
     ("human", "{query}")
@@ -502,11 +489,11 @@ Route to 'both' for questions that ask how a project relates to or aligns with P
 router_chain = router_prompt | r_logger | llm_router
 
 # Test -- route should = proj_vectorstore
-result = router_chain.invoke("Are there any airfield projects in Italy?") # proj_vectorstore
+#result = router_chain.invoke("Are there any airfield projects in Italy?") # proj_vectorstore
 #result = router_chain.invoke("How do players determine if a move is legal in Dungeons and Dragons?") # scen_vectorstore
 #result = router_chain.invoke("Where can I buy the materials needed to play Dungeons and Dragons?") # websearch
-print(result)
-print(result.tool_calls[0]["args"])
+#print(result)
+#print(result.tool_calls[0]["args"])
 #____________________________________________________________________________________________________________________________________________________
 
 
@@ -523,6 +510,7 @@ class GraphState(TypedDict):
     """
     question: str
     route: str | None
+    routes: NotRequired[list[str]]
     generation: NotRequired[str]
     max_retries: NotRequired[int]
     gen_attempts: NotRequired[Annotated[int, operator.add]]
@@ -550,6 +538,7 @@ def init_graph_state(state: dict) -> GraphState:
     initialized: GraphState = {
         "question": state["question"],
         "route": state.get("route", None),
+        "routes": state.get("routes", []),
         "generation": state.get("generation", ""),
         "max_retries": state.get("max_retries", 3),
         "gen_attempts": state.get("gen_attempts", 0),
@@ -571,10 +560,10 @@ def route_question_node(state: dict) -> dict:
     logger.debug(f"  Question to route: {question}")
 
     result = router_chain.invoke({"query": question})
-    route = result.tool_calls[0]["args"]["route"]
+    routes = result.tool_calls[0]["args"]["routes"]
 
-    logger.info(f"  Routing decision: {route}")
-    return {"route": route}
+    logger.info(f"  Routing decision: {routes}")
+    return {"routes": routes}
 
 
 
@@ -584,34 +573,45 @@ def extract_project_id(question: str) -> str | None:
     return match.group(0) if match else None
 
 def semantic_retrieve_w_scores(state: dict) -> dict:
-    route = state.get("route")
+    routes = state.get("routes", [])
     query = state["question"]
     k = state.get("k", 6)
     project_id = extract_project_id(query)
     filter_dict = {"project_id": project_id} if project_id else None
 
-    if route == "proj_vectorstore":
-        stores = [proj_vectorstore]
-    elif route == "strat26_vectorstore":
-        stores = [strat26_vectorstore]
-    elif route == "strat28_vectorstore":
-        stores = [strat28_vectorstore]
-    elif route == "both":
-        stores = [proj_vectorstore, strat26_vectorstore]  # query both
-    else:
+     # Map route names to actual vectorstores
+    store_map = {
+        "proj_vectorstore": proj_vectorstore,
+        "strat26_vectorstore": strat26_vectorstore,
+        "strat28_vectorstore": strat28_vectorstore 
+    }
+
+    # Build list of actual stores to query
+    stores = [store_map[r] for r in routes if r in store_map]
+
+    if not stores:
         return {"documents": []}
 
     all_docs = []
+
     for store in stores:
-        filt = filter_dict if store == proj_vectorstore else None  # only filter proj store
-        docs = store.similarity_search_with_relevance_scores(query, k=k, filter=filt)
+        # Only apply project_id filter to the project vectorstore
+        filt = filter_dict if store is proj_vectorstore else None
+
+        docs = store.similarity_search_with_relevance_scores(
+            query,
+            k=k,
+            filter=filt
+        )
         all_docs.extend(docs)
 
     # Sort combined results by score descending
     all_docs.sort(key=lambda x: x[1], reverse=True)
 
-    logger.info(f"  Retrieved {len(all_docs)} documents total across {len(stores)} store(s)")
+    logger.info(f"Retrieved {len(all_docs)} documents across {len(stores)} stores")
     return {"documents": all_docs}
+
+
 
 semantic_retriever = RunnableLambda(
     semantic_retrieve_w_scores,
@@ -620,30 +620,36 @@ semantic_retriever = RunnableLambda(
 
 rag_template = (
     ChatPromptTemplate.from_messages([
-        ("system", """You are a helpful assistant that answers questions based on the provided documents and any additional context passed into the prompt. \
-         
-         GENERAL RULES:
-         1) Use the provided documents as the source of truth concerning projects, facility requirements, and strategy.
-         2) If the documents do not contain the information necessary to answer the question, respond with "I don't know".
-         3) Do not generate any novel information not supported by documet content or tool outputs.
-         
-         RULES FOR WHEN NO DOCUMENTS ARE RETRIEVED:
-         1) If no documents are provided and no tool results are relevant, answer using general knowledge ONLY if the question does not have to do with Navy facilities projects.
-         2) If no documents are provided, no tool results are relevant, and the question IS about navy facilities projects, respond with "I don't know".
+        ("system", """You answer questions using only the retrieved documents. 
+Your role is to retrieve information from one or multiple document domains:
 
-         TOOL-AWARE BEHAVIOR RULES:
-         1) You will sometimes receive tool results (either dice rolls or websearch results). If these are provided, use them in generating your response.
-         2) Do NOT call tools from this prompt. Tool calls are to take place at an earlier stage of the workflow.
+- Project documents: scope, cost, justification, scoring, facility details.
+- POM26 strategy/policy: NSS/NDS themes and original CNIC scoring criteria.
+- POM28 strategy/policy: updated NSS/NDS themes and revised CNIC scoring criteria.
+- Facility criteria documents: definitions and scoring rules for PDS categories.
 
+GROUNDING RULES
+- Treat the retrieved documents as the authoritative source for all project, facility, and strategy content.
+- Do not invent or infer information that is not supported by the documents or tool outputs.
+- If the documents do not contain the information needed to answer the question, respond with “I don’t know.”
+
+MISSING‑EVIDENCE RULES
+- If no documents are retrieved and the question concerns Navy facilities projects, respond with “I don’t know.”
+- If no documents are retrieved and the question is general (not about Navy facilities), you may answer using general knowledge.
+
+ANSWERING RULES
+- Cite or reference document content in natural language.
+- When multiple document domains are retrieved, integrate them into a single coherent answer.
+- When POM26 and POM28 guidance conflict, clearly distinguish between them.
          """),
-        ("human", """Documents:
+        ("human", """Retrieved Documents:
 {context}
 
 Question: {query}
          
          {answer_instructions}
 
-Answer based on the documents above:""")
+Answer using only the retrived documents.""")
     ])
     .with_config(run_name="RAG_Prompt_Template")
 )
@@ -766,15 +772,8 @@ def check_answer_node(state: dict) -> dict:
 #____________________________________________________________________________________________________________________________________________________
 # Route Question Edge
 def route_question_edge(state: dict) -> str:
-    """Choose graph edge based on persisted route"""
-    route = state.get("route")
-
-    logger.info(f"EDGE: route_question_edge sees route={route!r}") #keys={list(state.keys())}")
-    
-    if route == "websearch":
-        return "websearch"
+    logger.info("EDGE: route_question_edge -> retrieve")
     return "retrieve"
-
 
 # Decide after checking generation edge:
 def decide_after_check(state: dict) -> str:
@@ -849,4 +848,24 @@ agent_as_chain = RunnableLambda(
 )
 
 eval_rag_chain_proj_query(agent_as_chain, q_num=15)
+
+# Test a "multi-part" question. For now, just want to verify that it selects multiple routes:
+print("\n\n=== MANUAL MULTI-PART TESTS ===")
+
+test_questions = [
+    "What was the justification for project P738, and how should its Mission Alignment score change under the updated POM28 guidance?",
+    "Summarize the scope of project RM16-0799 and explain how it aligns with the POM26 National Defense Strategy themes.",
+    "Provide the CWE and justification for project NF20-0826, and compare how its Readiness Support score would be interpreted under POM26 versus POM28 criteria.",
+    "How do the definitions of Operational Cost differ between POM26 and POM28 scoring guidance?"
+]
+
+for q in test_questions:
+    print("\n--- QUESTION ---")
+    print(q)
+    result = app.invoke({"question": q, "k": 6})
+    print("\n--- ROUTES SELECTED ---")
+    print(result.get("routes", "<no routes>"))
+    print("\n--- ANSWER ---")
+    print(result["generation"])
+    print("\n-------------------------")
 #____________________________________________________________________________________________________________________________________________________
