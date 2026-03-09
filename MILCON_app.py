@@ -433,19 +433,25 @@ def run_llm_intro(user_msg: str, history: list):
 
     def semantic_retrieve_w_scores(state: dict) -> dict:
         routes = state.get("routes", [])
-        query = state["question"]
+        full_question = state["question"]
         k = state.get("k", 6)
-        project_id = extract_project_id(query)
+
+        # Extract just the current question for vectorstore retrieval
+        # (conversation history pollutes the embedding search)
+        if "Current question:" in full_question:
+            retrieval_query = full_question.split("Current question:")[-1].strip()
+        else:
+            retrieval_query = full_question
+
+        project_id = extract_project_id(retrieval_query)
         filter_dict = {"project_id": project_id} if project_id else None
 
-        # Map route names to actual vectorstores
         store_map = {
             "proj_vectorstore": proj_vectorstore,
             "strat26_vectorstore": strat26_vectorstore,
             "strat28_vectorstore": strat28_vectorstore 
         }
 
-        # Build list of actual stores to query
         stores = [store_map[r] for r in routes if r in store_map]
 
         if not stores:
@@ -454,19 +460,15 @@ def run_llm_intro(user_msg: str, history: list):
         all_docs = []
 
         for store in stores:
-            # Only apply project_id filter to the project vectorstore
             filt = filter_dict if store is proj_vectorstore else None
-
             docs = store.similarity_search_with_relevance_scores(
-                query,
+                retrieval_query,   # <-- was: query (full history-enriched question)
                 k=k,
                 filter=filt
             )
             all_docs.extend(docs)
 
-        # Sort combined results by score descending
         all_docs.sort(key=lambda x: x[1], reverse=True)
-
         logger.info(f"Retrieved {len(all_docs)} documents across {len(stores)} stores")
         return {"documents": all_docs}
 
