@@ -9,8 +9,6 @@
 # I used ChatGPT-5.1, Copilot, and Streamlit's documentation to help write this code, so I'll
 # narrate this code to explain its functionality and purpose.
 
-
-import polars as pl
 import streamlit as st
 import pandas as pd
 import altair as alt
