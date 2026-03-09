@@ -128,7 +128,7 @@ import re
 
 # Third party
 import requests
-from IPython.display import Image, display
+# from IPython.display import Image, display
 from typing_extensions import NotRequired, TypedDict
 
 # Pydantic
