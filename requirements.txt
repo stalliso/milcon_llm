@@ -1,9 +1,41 @@
+# MILCON & FSRM PDS Reference — Python dependencies
+# Install with:  pip install -r requirements.txt
+
+# Streamlit
 streamlit
-polars[sqlalchemy]
-pandas
-altair
+
+# LangChain ecosystem
+langchain-core
+langchain-community
+langchain-text-splitters
+langchain-huggingface
+langchain-experimental
+langchain-chroma
+langchain-openai
+langgraph
+
+# Vector store + embeddings
+chromadb
+sentence-transformers
+
+# PDF parsing (PyMuPDFLoader backend)
+pymupdf
+
+# Sparse retrieval (BM25Retriever backend)
+rank-bm25
+
+# LLM client
 openai
-SQLAlchemy
-connectorx
-tabulate
-pydeck
+
+# ML / data
+numpy
+scikit-learn
+
+# NLP utilities
+textblob
+
+# Misc
+pydantic
+tqdm
+requests
+typing-extensions
