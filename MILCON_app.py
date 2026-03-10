@@ -228,13 +228,13 @@ system_prompt = (
 
 @st.cache_resource
 def load_resources():
-    embedding_function = setup_embedding_function()
+    embedding_function = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
+    )
     proj_vs = load_vectorstore("./databases/proj", embedding_function=embedding_function)
     strat26_vs = load_vectorstore("./databases/strat26", embedding_function=embedding_function)
     strat28_vs = load_vectorstore("./databases/strat28", embedding_function=embedding_function)
     return embedding_function, proj_vs, strat26_vs, strat28_vs
-
-baseline_hfe, proj_vectorstore, strat26_vectorstore, strat28_vectorstore = load_resources()
 
 @st.cache_resource
 def build_llm_clients():
@@ -256,6 +256,8 @@ def build_llm_clients():
         name="qwen_gen"
     )
     return llm_md_tools, llm_gen_tools
+
+baseline_hfe, proj_vectorstore, strat26_vectorstore, strat28_vectorstore = load_resources()
 llm_md_tools, llm_gen_tools = build_llm_clients()
 
 # Setup logging for tool creation and testing
@@ -433,19 +435,19 @@ def run_llm_intro(user_msg: str, history: list):
         return match.group(0).upper() if match else None  # normalize to uppercase
 
     def semantic_retrieve_w_scores(state: dict) -> dict:
+        logger.info("NODE: Semantic Retrieve - Starting retrieval")  # ADD THIS
         routes = state.get("routes", [])
         full_question = state["question"]
         k = state.get("k", 6)
 
-        # Extract just the current question for vectorstore retrieval
-        # (conversation history pollutes the embedding search)
         if "Current question:" in full_question:
             retrieval_query = full_question.split("Current question:")[-1].strip()
         else:
             retrieval_query = full_question
 
         project_id = extract_project_id(retrieval_query)
-        filter_dict = {"project_id": project_id} if project_id else None
+        filter_dict = {"project_id": {"$eq": project_id}} if project_id else None
+        logger.info(f"  project_id extracted: {project_id}, filter: {filter_dict}")  # ADD THIS
 
         store_map = {
             "proj_vectorstore": proj_vectorstore,
@@ -454,6 +456,7 @@ def run_llm_intro(user_msg: str, history: list):
         }
 
         stores = [store_map[r] for r in routes if r in store_map]
+        logger.info(f"  Stores to query: {[r for r in routes if r in store_map]}")  # ADD THIS
 
         if not stores:
             return {"documents": []}
@@ -462,15 +465,14 @@ def run_llm_intro(user_msg: str, history: list):
 
         for store in stores:
             filt = filter_dict if store is proj_vectorstore else None
+            logger.info(f"  Querying store with filter: {filt}")  # ADD THIS
             docs = store.similarity_search_with_relevance_scores(
-                retrieval_query,   # <-- was: query (full history-enriched question)
+                retrieval_query,
                 k=k,
                 filter=filt
             )
+            logger.info(f"  Got {len(docs)} docs from store")  # ADD THIS
             all_docs.extend(docs)
-
-        all_docs.sort(key=lambda x: x[1], reverse=True)
-        logger.info(f"Retrieved {len(all_docs)} documents across {len(stores)} stores")
         return {"documents": all_docs}
 
 
