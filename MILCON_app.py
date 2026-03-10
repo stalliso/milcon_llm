@@ -169,6 +169,7 @@ from helper_code.rag.load_dataset import setup_embedding_function, load_db_from_
 # WEBPAGE CONFIGURATION
 # --------------------------------------
 
+
 st.set_page_config(                                     # Streamlit page configuration
     page_title="MILCON and FSRM Project Data Sheet Reference",  # Page title
     layout="wide"                                      # Use wide layout
@@ -225,35 +226,19 @@ system_prompt = (
     "Answer questions using only the retrieved project and strategy documents."
 )
 
-# Initialize vectorstores (adjust paths/collection names to match your setup)
-hfe = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+@st.cache_resource
+def load_resources():
+    embedding_function = setup_embedding_function()
+    proj_vs = load_vectorstore("./databases/proj", embedding_function=embedding_function)
+    strat26_vs = load_vectorstore("./databases/strat26", embedding_function=embedding_function)
+    strat28_vs = load_vectorstore("./databases/strat28", embedding_function=embedding_function)
+    return embedding_function, proj_vs, strat26_vs, strat28_vs
 
-# Load vectorstores:
-proj_vectorstore_path: str = "./databases/proj"
-proj_vectorstore = load_vectorstore(proj_vectorstore_path, embedding_function=baseline_hfe)
+baseline_hfe, proj_vectorstore, strat26_vectorstore, strat28_vectorstore = load_resources()
 
-strat26_vectorstore_path: str = "./databases/strat26"
-strat26_vectorstore = load_vectorstore(strat26_vectorstore_path, embedding_function=baseline_hfe)
-
-strat28_vectorstore_path: str = "./databases/strat28"
-strat28_vectorstore = load_vectorstore(strat28_vectorstore_path, embedding_function=baseline_hfe)
-
-
-def run_llm_intro(user_msg: str, history: list):
-    """Call NVIDIA's hosted model we set in secrets.toml
-       with some context from the currently filtered dataframe.
-       This function is for the INTRO PAGE - no df is passed in.
-    --------------------------------------
-    Args:
-        user_msg (str): user's inputs into the chat
-        history (list[dicts[str]]): record of the user's chat messages for context
-    --------------------------------------
-    Returns:
-        string: LLM's response to the user's inputs (comes from a ChatCompletion object)
-    """    
-
-
-        ########## ROUTER MODEL ##########
+@st.cache_resource
+def build_llm_clients():
+            ########## ROUTER MODEL ##########
     llm_md_tools = ChatOpenAI(
         base_url=st.secrets["NVIDIA_API_BASE"],
         model=st.secrets["NVIDIA_MODEL"],
@@ -270,31 +255,47 @@ def run_llm_intro(user_msg: str, history: list):
         temperature=0.3,
         name="qwen_gen"
     )
+    return llm_md_tools, llm_gen_tools
+llm_md_tools, llm_gen_tools = build_llm_clients()
 
-    # Setup logging for tool creation and testing
-    logger = logging.getLogger("agentic_workflow")
-    logger.setLevel(logging.DEBUG)
+# Setup logging for tool creation and testing
+logger = logging.getLogger("agentic_workflow")
+logger.setLevel(logging.DEBUG)
 
-    # Add console handler if not already present
-    if not logger.handlers:
-        console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.DEBUG)
-        formatter = logging.Formatter('%(levelname)s - %(message)s')
-        console_handler.setFormatter(formatter)
-        logger.addHandler(console_handler)
+# Add console handler if not already present
+if not logger.handlers:
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('%(levelname)s - %(message)s')
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    # Add this temporarily at the top of run_llm_intro, before anything else
+# from openai import OpenAI
+# client = OpenAI(
+#     base_url=st.secrets["NVIDIA_API_BASE"],
+#     api_key=st.secrets["NVIDIA_API_KEY"]
+# )
+# models = client.models.list()
+# for m in models.data[:-1]:
+#     logger.info(f"  AVAILABLE MODEL: {m.id}")
     
-        # Add this temporarily at the top of run_llm_intro, before anything else
-    # from openai import OpenAI
-    # client = OpenAI(
-    #     base_url=st.secrets["NVIDIA_API_BASE"],
-    #     api_key=st.secrets["NVIDIA_API_KEY"]
-    # )
-    # models = client.models.list()
-    # for m in models.data[:-1]:
-    #     logger.info(f"  AVAILABLE MODEL: {m.id}")
-        
 
-    logger.info("Logger configured for tool creation and testing")
+logger.info("Logger configured for tool creation and testing")
+
+def run_llm_intro(user_msg: str, history: list):
+    """Call NVIDIA's hosted model we set in secrets.toml
+       with some context from the currently filtered dataframe.
+       This function is for the INTRO PAGE - no df is passed in.
+    --------------------------------------
+    Args:
+        user_msg (str): user's inputs into the chat
+        history (list[dicts[str]]): record of the user's chat messages for context
+    --------------------------------------
+    Returns:
+        string: LLM's response to the user's inputs (comes from a ChatCompletion object)
+    """    
+
 
     # create logging runnable to track router chain execution
     def logging_helper(state: dict) -> dict:
