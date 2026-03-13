@@ -70,7 +70,8 @@ from eval.eval_task1_quant import (
     eval_rag_chain_proj_query,
     llm,
 )
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed 
+
 from eval.eval_multi_part import EXPECTED_ROUTES, MULTI_PART_QUESTIONS
 
 # Project - helper code
@@ -160,6 +161,33 @@ llm_gen_tools = ChatOpenAI(
     temperature=0.3,
     name="llama"
 )
+
+########## GRADER MODEL ##########
+llm_grader = ChatOpenAI(
+    base_url=BASE_URL,
+    model=model_ids[1],  # google/gemma-3-27b-it
+    api_key=API_KEY,
+    temperature=0,
+    name="grader"
+)
+
+grader_prompt = ChatPromptTemplate.from_messages([
+    ("system", """You are a grader assessing whether an answer is grounded in the retrieved documents.
+Respond with ONLY 'yes' or 'no'. No explanation.
+
+- 'yes': The answer is supported by the retrieved context and directly addresses the question.
+- 'no': The answer contains information not in the context, says 'I don't know', or fails to address the question."""),
+    ("human", """Retrieved Context:
+{context}
+
+Question: {question}
+
+Answer: {generation}
+
+Is the answer grounded in the context?""")
+])
+
+grader_chain = grader_prompt | llm_grader | StrOutputParser()
 #____________________________________________________________________________________________________________________________________________________
 
 # LOGGER SETUP:
@@ -461,52 +489,44 @@ idk_phrases = [
 ]
 
 def check_answer_node(state: dict) -> dict:
-    """
-    Post-generate checker.
-    Sets state['route_after_check'] to 'websearch' or 'final'
-    and increments state['websearch_retries'] when routing to websearch.
-    """
-    
-    logger.info("NODE: Checking if retrieved answer contains IDK")
+    logger.info("NODE: Check Answer")
 
-    generation = state.get("generation", "")
-    documents = state.get("documents", []) 
+    question    = state.get("question", "")
+    generation  = state.get("generation", "")
+    documents   = state.get("documents", [])
+    attempts    = state.get("gen_attempts", 0)
+    max_retries = state.get("max_retries", 3)
 
-    # Use this entire commented section if you want to preview the retrieved context as part of your output
-    # ---- Build context preview ----
-    context_preview_parts = []
-    for i, (doc, score) in enumerate(documents[:2]):  # limit to first 2 docs
-        snippet = (
-            doc.page_content
-            .replace("\n", " ")
-            .strip()[:350]
-        )
-        context_preview_parts.append(
-            f"[doc{i} score={score:.2f}] {snippet}"
-        )
+    # ---- IDK check ----
+    if any(phrase.lower() in generation.lower() for phrase in idk_phrases):
+        logger.info("  IDK detected")
+        if attempts < max_retries:
+            return {"route_after_check": "retry"}
+        return {"route_after_check": "final"}
 
-    context_preview = " | ".join(context_preview_parts) or "<no documents>"
+    # ---- exact match enforcement for multiple choice ----
+    if bool(re.search(r'\b[A-D]\)', question)):
+        if not re.search(r'\b[A-D]\) ?\S+', generation):
+            logger.info("  No valid answer choice found")
+            if attempts < max_retries:
+                return {"route_after_check": "retry"}
+        logger.info("  Multiple choice answer found -> final")
+        return {"route_after_check": "final"}
 
-    # # ---- Generation preview ----
-    gen_preview = generation.replace("\n", " ")[:120] if generation else "<empty>"
+    # ---- LLM grounding check for open-ended ----
+    context = "\n\n---\n\n".join([doc.page_content for doc, _ in documents[:4]])
+    grade = grader_chain.invoke({
+        "context":    context,
+        "question":   question,
+        "generation": generation,
+    }).strip().lower()
 
-    # # ---- Side-by-side log ----
-    logger.info(
-        "\n"
-        "  ===== RAG CHECK =====\n"
-        f"  Docs count : {len(documents)}\n"
-        f"  Context    : {context_preview}\n"
-        f"  Generation : {gen_preview}\n"
-        "  ====================="
-    )
-    # end of commented section for previewing retrieved context
-    
-    #logger.info()
+    logger.info(f"  Grader verdict: {grade}")
 
-    logger.info("  Generation is acceptable -> final")
-    return {
-        "route_after_check": "final",
-    }
+    if grade == "no" and attempts < max_retries:
+        return {"route_after_check": "retry"}
+
+    return {"route_after_check": "final"}
 
 #____________________________________________________________________________________________________________________________________________________
 
@@ -560,10 +580,10 @@ workflow.add_edge("generate_response", "check_answer")
 workflow.add_conditional_edges("check_answer",
                                decide_after_check,
                                {
-                                   "final": END
+                                   "final": END,
+                                   "retry": "semantic_retriever_and_grader"
                                }
                                )
-
 # Compile the graph
 app = workflow.compile()
 
@@ -579,8 +599,8 @@ agent_as_chain = RunnableLambda(
 logging.getLogger("agentic_workflow").setLevel(logging.WARNING)
 warnings.filterwarnings("ignore", category=UserWarning)
 
-num_qa_runs    = 1
-num_multi_runs = 1
+num_qa_runs    = 30
+num_multi_runs = 3
 
 def run_qa(_):
     # now returns (accuracy, missed_questions)
@@ -590,11 +610,16 @@ def run_multi(_):
     return eval_multi_part_routing(app, k=6, verbose=False)
 
 with ThreadPoolExecutor(max_workers=8) as executor:
-    qa_futures    = [executor.submit(run_qa,    i) for i in range(num_qa_runs)]
-    multi_futures = [executor.submit(run_multi, i) for i in range(num_multi_runs)]
+    qa_futures    = {executor.submit(run_qa,    i): i for i in range(num_qa_runs)}
+    multi_futures = {executor.submit(run_multi, i): i for i in range(num_multi_runs)}
 
-    qa_results_raw  = [f.result() for f in tqdm(qa_futures,    desc="QA runs",      unit="run")]
-    multi_part_list = [f.result() for f in tqdm(multi_futures, desc="Routing runs",  unit="run")]
+    qa_results_raw = []
+    for f in tqdm(as_completed(qa_futures), total=num_qa_runs, desc="QA runs", unit="run"):
+        qa_results_raw.append(f.result())
+
+    multi_part_list = []
+    for f in tqdm(as_completed(multi_futures), total=num_multi_runs, desc="Routing runs", unit="run"):
+        multi_part_list.append(f.result())
 
 # ---- unpack QA results ----
 qa_accuracies  = [r[0] for r in qa_results_raw]

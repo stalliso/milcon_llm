@@ -1,13 +1,4 @@
-# Luke Holmes
-
-# Intro page to Vietnam Bombing Dashboard
-# This is what's known as the "Entry Point" page for the Streamlit app. It provides an 
-# overview of the dashboard, its purpose, and the data source. It also sets up the page
-# configuration and title. The scripts in the "pages" folder contain the subsequent pages
-# of the dashboard, which are accessible via the sidebar navigation in Streamlit.
-
-# I used ChatGPT-5.1, Copilot, and Streamlit's documentation to help write this code, so I'll
-# narrate this code to explain its functionality and purpose.
+# Adapted from code by Luke Holmes
 
 import streamlit as st
 import pandas as pd
@@ -255,10 +246,37 @@ def build_llm_clients():
         temperature=0.3,
         name="qwen_gen"
     )
-    return llm_md_tools, llm_gen_tools
+
+    ########## GRADER MODEL ##########
+    llm_grader = ChatOpenAI(
+        base_url=st.secrets["NVIDIA_API_BASE"],
+        model=st.secrets["NVIDIA_MODEL"],
+        api_key=st.secrets["NVIDIA_API_KEY"],
+        temperature=0,
+        name="grader"
+    )
+
+    grader_prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are a grader assessing whether an answer is grounded in the retrieved documents.
+        Respond with ONLY 'yes' or 'no'. No explanation.
+
+        - 'yes': The answer is supported by the retrieved context and directly addresses the question.
+        - 'no': The answer contains information not in the context, says 'I don't know', or fails to address the question."""),
+            ("human", """Retrieved Context:
+        {context}
+
+        Question: {question}
+
+        Answer: {generation}
+
+        Is the answer grounded in the context?""")
+        ])
+
+    grader_chain = grader_prompt | llm_grader | StrOutputParser()
+    return llm_md_tools, llm_gen_tools, grader_chain
 
 baseline_hfe, proj_vectorstore, strat26_vectorstore, strat28_vectorstore = load_resources()
-llm_md_tools, llm_gen_tools = build_llm_clients()
+llm_md_tools, llm_gen_tools, grader_chain = build_llm_clients()
 
 # Setup logging for tool creation and testing
 logger = logging.getLogger("agentic_workflow")
@@ -598,52 +616,44 @@ def run_llm_intro(user_msg: str, history: list):
     ]
 
     def check_answer_node(state: dict) -> dict:
-        """
-        Post-generate checker.
-        Sets state['route_after_check'] to 'websearch' or 'final'
-        and increments state['websearch_retries'] when routing to websearch.
-        """
-        
-        logger.info("NODE: Checking if retrieved answer contains IDK")
+        logger.info("NODE: Check Answer")
 
-        generation = state.get("generation", "")
-        documents = state.get("documents", []) 
+        question    = state.get("question", "")
+        generation  = state.get("generation", "")
+        documents   = state.get("documents", [])
+        attempts    = state.get("gen_attempts", 0)
+        max_retries = state.get("max_retries", 3)
 
-        # Use this entire commented section if you want to preview the retrieved context as part of your output
-        # ---- Build context preview ----
-        context_preview_parts = []
-        for i, (doc, score) in enumerate(documents[:2]):  # limit to first 2 docs
-            snippet = (
-                doc.page_content
-                .replace("\n", " ")
-                .strip()[:350]
-            )
-            context_preview_parts.append(
-                f"[doc{i} score={score:.2f}] {snippet}"
-            )
+        # ---- IDK check ----
+        if any(phrase.lower() in generation.lower() for phrase in idk_phrases):
+            logger.info("  IDK detected")
+            if attempts < max_retries:
+                return {"route_after_check": "retry"}
+            return {"route_after_check": "final"}
 
-        context_preview = " | ".join(context_preview_parts) or "<no documents>"
+        # ---- exact match enforcement for multiple choice ----
+        if bool(re.search(r'\b[A-D]\)', question)):
+            if not re.search(r'\b[A-D]\) ?\S+', generation):
+                logger.info("  No valid answer choice found")
+                if attempts < max_retries:
+                    return {"route_after_check": "retry"}
+            logger.info("  Multiple choice answer found -> final")
+            return {"route_after_check": "final"}
 
-        # # ---- Generation preview ----
-        gen_preview = generation.replace("\n", " ")[:120] if generation else "<empty>"
+        # ---- LLM grounding check for open-ended ----
+        context = "\n\n---\n\n".join([doc.page_content for doc, _ in documents[:4]])
+        grade = grader_chain.invoke({
+            "context":    context,
+            "question":   question,
+            "generation": generation,
+        }).strip().lower()
 
-        # # ---- Side-by-side log ----
-        logger.info(
-            "\n"
-            "  ===== RAG CHECK =====\n"
-            f"  Docs count : {len(documents)}\n"
-            f"  Context    : {context_preview}\n"
-            f"  Generation : {gen_preview}\n"
-            "  ====================="
-        )
-        # end of commented section for previewing retrieved context
-        
-        #logger.info()
+        logger.info(f"  Grader verdict: {grade}")
 
-        logger.info("  Generation is acceptable -> final")
-        return {
-            "route_after_check": "final",
-        }
+        if grade == "no" and attempts < max_retries:
+            return {"route_after_check": "retry"}
+
+        return {"route_after_check": "final"}
 
     #____________________________________________________________________________________________________________________________________________________
 
@@ -703,7 +713,8 @@ def run_llm_intro(user_msg: str, history: list):
     workflow.add_conditional_edges("check_answer",
                                 decide_after_check,
                                 {
-                                    "final": END
+                                    "final": END,
+                                    "retry": "semantic_retriever_and_grader"
                                 }
                                 )
 

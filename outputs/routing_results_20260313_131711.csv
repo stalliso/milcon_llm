@@ -1,0 +1,16 @@
+question,passes,runs,pass_rate,expected_routes
+Q10_scoring_rubric_pom26_vs_pom28,3,3,1.0,strat26_vectorstore|strat28_vectorstore
+Q11_lift_station_rehab_pom26,3,3,1.0,proj_vectorstore|strat26_vectorstore
+Q12_energy_resilience_pom28,3,3,1.0,proj_vectorstore|strat28_vectorstore
+Q13_airfield_apron_full_comparison,3,3,1.0,proj_vectorstore|strat26_vectorstore|strat28_vectorstore
+Q14_air_passenger_terminal_pom26,3,3,1.0,proj_vectorstore|strat26_vectorstore
+Q15_arm_dearm_berm_full,3,3,1.0,proj_vectorstore|strat26_vectorstore|strat28_vectorstore
+Q1_fire_water_pom26_pom28,3,3,1.0,proj_vectorstore|strat26_vectorstore|strat28_vectorstore
+Q2_airfield_pom26_alignment,3,3,1.0,proj_vectorstore|strat26_vectorstore
+Q3_port_ops_warehouse_pom28_rescore,3,3,1.0,proj_vectorstore|strat28_vectorstore
+Q4_galley_ii_strategy_comparison,3,3,1.0,proj_vectorstore|strat26_vectorstore|strat28_vectorstore
+Q5_aimd_hangar_project_details,3,3,1.0,proj_vectorstore
+Q6_air_freight_terminal_pom26,3,3,1.0,proj_vectorstore|strat26_vectorstore
+Q7_beq_perm_party_pom28,3,3,1.0,proj_vectorstore|strat28_vectorstore
+Q8_wastewater_souda_bay_full,3,3,1.0,proj_vectorstore|strat26_vectorstore|strat28_vectorstore
+Q9_air_cargo_terminal_attributes,3,3,1.0,proj_vectorstore
