@@ -1,270 +1,90 @@
-#____________________________________________________________________________________________________________________________________________________
+# ____________________________________________________________________________________________________________________________________________
 #
 #                                               MILCON LLM WORKFLOW SCRIPT
 #                                            (Single-Router/Retriever Version)
 #
 #____________________________________________________________________________________________________________________________________________________
 
-
-
-
 # IMPORTS:
 #____________________________________________________________________________________________________________________________________________________
-# Basic imports
-import os
-import re
-import textwrap
-
-# RAG components
-from langchain_community.document_loaders import PyMuPDFLoader
-from langchain_text_splitters import CharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
-
-# LangChain tools
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnableLambda
-
-# LLM
-from langchain_openai import ChatOpenAI
-
-# DO NOT MODIFY THESE
-from eval.eval_task1_quant import llm, eval_rag_chain_proj_query
-
-# These are provided as reference
-# You do not NEED to use these
-from eval.eval_task1_quant import (
-    baseline_hfe, baseline_vectorstore,
-    baseline_retriever, baseline_rag_chain
-)
-
-from helper_code.parser import *
-
-import json
-from langchain_core.documents import Document
-
-# General
-# Functions for interacting with the operating system
-import os
-
-# Disable parallelism warnings from Hugging Face tokenizers
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-# Clean print statements
-import textwrap
-
-# Get PDFs as Document object
-from langchain_community.document_loaders import PyMuPDFLoader
-
-# Recursive parsing
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-
-# Dynamic Semantic Chunking
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_experimental.text_splitter import SemanticChunker
-
-# For setting up vectorstore
-from langchain_chroma import Chroma
-
-# Supports literal conversion
-import ast
-
-# Option for easy text cleaning
-from textblob import TextBlob
-
-# Allows for async calls to llms
-import asyncio
-
-# For comparing serial vs. async calls
-import time
-
-# Clients for access TDAC hosted models via OpenAI APIs
-from openai import OpenAI, AsyncOpenAI
-
-# To measure semantic similarity
-import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
-
-# For sparse retrieval
-from langchain_community.retrievers import BM25Retriever
-
-# For Cross-Encoder retrieval
-from sentence_transformers import CrossEncoder
-
-# RAG components
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
-
-# LangChain tools
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnableLambda
-
-# LLM
-from langchain_openai import ChatOpenAI
-
 # Standard library
+import ast
+import asyncio
 import json
 import logging
 import operator
 import os
+import re
 import sys
+import textwrap
+import time
+import warnings
+from collections import defaultdict
 from pathlib import Path
 from pprint import pprint
 from types import SimpleNamespace
 from typing import Annotated, List, Literal
-from tqdm import tqdm
-import random
-import re
+import csv, datetime
 
-# Third party
+# Third-party
+import numpy as np
 import requests
 from IPython.display import Image, display
+from pydantic import BaseModel, Field
+from sentence_transformers import CrossEncoder
+from sklearn.metrics.pairwise import cosine_similarity
+from textblob import TextBlob
+from tqdm import tqdm
 from typing_extensions import NotRequired, TypedDict
 
-# Pydantic
-from pydantic import BaseModel, Field
-
 # OpenAI
-from openai import OpenAI
+from openai import AsyncOpenAI, OpenAI
 
-# LangChain Core
+# LangChain
+from langchain_chroma import Chroma
+from langchain_community.document_loaders import PyMuPDFLoader
+from langchain_community.retrievers import BM25Retriever
+from langchain_community.tools import DuckDuckGoSearchResults
 from langchain_core.documents import Document
+from langchain_core.messages import ToolMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableLambda, RunnablePassthrough
 from langchain_core.tools import tool
-from langchain_core.messages import ToolMessage
-
-# LangChain potpurri
+from langchain_experimental.text_splitter import SemanticChunker
+from langchain_huggingface import HuggingFaceEmbeddings, HuggingFaceEndpointEmbeddings
+from langchain_openai import ChatOpenAI
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEndpointEmbeddings, HuggingFaceEmbeddings
-from langchain_chroma import Chroma
 from chromadb.utils.embedding_functions import HuggingFaceEmbeddingServer
 
-# LangChain OpenAI
-from langchain_openai import ChatOpenAI
-
-# LangChain Community
-from langchain_community.tools import DuckDuckGoSearchResults
-from langchain_community.document_loaders import PyMuPDFLoader
-
 # LangGraph
-from langgraph.graph import StateGraph, END
+from langgraph.graph import END, StateGraph
 
-# Add the PARENT directory (oa4910) to sys.path and load helper functions
+# Project - eval
+from eval.eval_multi_part import eval_multi_part_routing
+from eval.eval_task1_quant import (
+    baseline_hfe,
+    baseline_rag_chain,
+    baseline_retriever,
+    baseline_vectorstore,
+    eval_rag_chain_proj_query,
+    llm,
+)
+from concurrent.futures import ThreadPoolExecutor
+from eval.eval_multi_part import EXPECTED_ROUTES, MULTI_PART_QUESTIONS
+
+# Project - helper code
 sys.path.append(str(Path.cwd().parent))
-from helper_code.rag.load_dataset import setup_embedding_function, load_db_from_dir, load_vectorstore
-#____________________________________________________________________________________________________________________________________________________
+from helper_code.build_vectorstores import build_vectorstores
+from helper_code.parser import *
+from helper_code.rag.load_dataset import load_db_from_dir, load_vectorstore, setup_embedding_function
+from helper_code.export_eval import export_eval_summary_png                   #
+from eval.eval_multi_part import MULTI_PART_QUESTIONS, EXPECTED_ROUTES
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
 
-
-
-
-# DOCUMENT PARSING:
-#____________________________________________________________________________________________________________________________________________________
-########## PROJECT DATA SHEETS ##########
-# Path to documents
-directory = "docs/projects"
-proj_doc_paths = [os.path.join(directory, filename) for filename in os.listdir(directory) if filename.endswith('.pdf')]
-
-# We will build the flat list directly
-proj_docs_flat = []
-
-for doc_path in proj_doc_paths:
-    try:
-        # 1. Parse the PDF using your custom logic
-        boxes = FormTextExtractor(doc_path).extract_boxes()
-        pds_dict = get_pds(boxes)
-        
-        # 2. Extract the Project ID (the top-level key) and the data payload
-        project_id = list(pds_dict.keys())[0]
-        project_data = pds_dict[project_id]
-        
-        # 3. Convert the nested dictionary into a structured string for the LLM to read.
-        page_content = json.dumps(project_data, indent=2)
-        
-        # 4. Create the LangChain Document with ALL top section fields as metadata
-        doc = Document(
-            page_content=page_content,
-            metadata={
-                "source": doc_path,
-                "project_id": project_id,
-                "title": project_data.get("title"),
-                "installation": project_data.get("installation"),
-                "CWE": project_data.get("CWE"),
-                "CCN": project_data.get("CCN"),
-                "region": project_data.get("region"),
-                "lead_proponent": project_data.get("lead_proponent"),
-                "COCOM": project_data.get("COCOM"),
-                "scope": project_data.get("scope"),
-                "impact_if_not_provided": project_data.get("impact_if_not_provided")
-            }
-        )
-        
-        proj_docs_flat.append(doc)
-        
-    except Exception as e:
-        print(f"Error processing {doc_path}: {type(e).__name__} - {e}")
-
-# Verify
-#print(f'Total Documents Processed: {len(proj_docs_flat)}')
-
-
-########## POM26 STRATEGY ##########
-# Path to documents
-directory = "docs/strategy/pom26"
-strat26_doc_paths = [
-    os.path.join(directory, filename) 
-    for filename in os.listdir(directory) 
-    if filename.endswith('.pdf')
-    ]
-
-# Extract text into documents
-strat26_docs_multilevel = [
-    PyMuPDFLoader(doc_path).load() 
-    for doc_path in strat26_doc_paths
-    ]
-
-# Flatten docs into 1 dim list
-strat26_docs_flat = [
-    item 
-    for sublist in strat26_docs_multilevel 
-    for item in sublist
-    ]
-
-########## POM28 STRATEGY ##########
-# Path to documents
-directory = "docs/strategy/pom28"
-strat28_doc_paths = [
-    os.path.join(directory, filename) 
-    for filename in os.listdir(directory) 
-    if filename.endswith('.pdf')
-    ]
-
-# Extract text into documents
-strat28_docs_multilevel = [
-    PyMuPDFLoader(doc_path).load() 
-    for doc_path in strat28_doc_paths
-    ]
-
-# Flatten docs into 1 dim list
-strat28_docs_flat = [
-    item 
-    for sublist in strat28_docs_multilevel 
-    for item in sublist
-    ]
-#____________________________________________________________________________________________________________________________________________________
-
-
-
-
-
-
-# EMBEDDINGS:
-#____________________________________________________________________________________________________________________________________________________
-# Embedding model
 embed_model_name = "sentence-transformers/all-MiniLM-L6-v2"
 model_kwargs = {"device": "cpu"}
 encode_kwargs = {"normalize_embeddings": False}
@@ -274,61 +94,19 @@ baseline_hfe = HuggingFaceEmbeddings(
     model_kwargs=model_kwargs,
     encode_kwargs=encode_kwargs,
 )
-#____________________________________________________________________________________________________________________________________________________
 
+# Or just check the directory itself is non-empty
+def db_exists(path):
+    p = Path(path)
+    return p.exists() and any(p.iterdir())
 
+if not all(db_exists(p) for p in ["./databases/proj", "./databases/strat26", "./databases/strat28"]):
 
-
-
-
-# CHUNKING AND VECTORSTORE CREATION:
-#____________________________________________________________________________________________________________________________________________________
-# Recursive text splitting
-# `chunk_size` and `chunk_overlap` are tunable hyperparameters
-# `separators` can also be used to specify what to split on
-recursive_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=1000,
-    chunk_overlap=200
-)
-
-# Creates chunks from documents using the splitter
-recursive_proj_docs = recursive_splitter.transform_documents(proj_docs_flat)
-recursive_strat26_docs = recursive_splitter.transform_documents(strat26_docs_flat)
-recursive_strat28_docs = recursive_splitter.transform_documents(strat28_docs_flat)
-
-# Add unique chunk id as metadata
-# Chromadb requires strings for metadata
-# Crombadb will throw an error if id is 0
-for i, chunk in enumerate(recursive_proj_docs, start=1):
-    chunk.metadata['id'] = str(i)
-for i, chunk in enumerate(recursive_strat26_docs, start=1):
-    chunk.metadata['id'] = str(i)
-for i, chunk in enumerate(recursive_strat28_docs, start=1):
-    chunk.metadata['id'] = str(i)
-
-# Create vectore store for base recursive method
-# Saved locally
-recursive_chunk_vectorstore_proj = Chroma.from_documents(
-    documents=recursive_proj_docs, 
-    embedding=baseline_hfe,
-    persist_directory="databases/proj",
-    ids=[doc.metadata["id"] for doc in recursive_proj_docs]
-)
-recursive_chunk_vectorstore_strat26 = Chroma.from_documents(
-    documents=recursive_strat26_docs, 
-    embedding=baseline_hfe,
-    persist_directory="databases/strat26",
-    ids=[doc.metadata["id"] for doc in recursive_strat26_docs]
-)
-recursive_chunk_vectorstore_strat28 = Chroma.from_documents(
-    documents=recursive_strat28_docs, 
-    embedding=baseline_hfe,
-    persist_directory="databases/strat28",
-    ids=[doc.metadata["id"] for doc in recursive_strat28_docs]
-)
+    print("One or more vectorstores are missing. Please run milcon_doc_vectorstore.py to create them.")
+    build_vectorstores()
 
 # Load vectorstores:
-proj_vectorstore_path: str = "./databases/proj"
+proj_vectorstore_path: str = "databases/proj"
 proj_vectorstore = load_vectorstore(proj_vectorstore_path, embedding_function=baseline_hfe)
 
 strat26_vectorstore_path: str = "./databases/strat26"
@@ -337,11 +115,6 @@ strat26_vectorstore = load_vectorstore(strat26_vectorstore_path, embedding_funct
 strat28_vectorstore_path: str = "./databases/strat28"
 strat28_vectorstore = load_vectorstore(strat28_vectorstore_path, embedding_function=baseline_hfe)
 #____________________________________________________________________________________________________________________________________________________
-
-
-
-
-
 
 # INITIALIZE LLMS:
 #____________________________________________________________________________________________________________________________________________________
@@ -364,7 +137,7 @@ try:
         model_ids.append(model['id'])
     model_id = info['data'][0]['id']
     print(f"Available Models: {model_ids}")
-    print(f"\nDefault Selected Model Id: {model_id}")
+    # print(f"\nDefault Selected Model Id: {model_id}")
 except Exception as e:
     print(f"Error accessing model endpoint: {e}")
 
@@ -388,13 +161,6 @@ llm_gen_tools = ChatOpenAI(
     name="llama"
 )
 #____________________________________________________________________________________________________________________________________________________
-
-
-
-
-
-
-
 
 # LOGGER SETUP:
 #____________________________________________________________________________________________________________________________________________________
@@ -420,10 +186,6 @@ def logging_helper(state: dict) -> dict:
 
 r_logger = RunnableLambda( logging_helper, name= "log chain state")
 #____________________________________________________________________________________________________________________________________________________
-
-
-
-
 
 
 
@@ -496,11 +258,6 @@ router_chain = router_prompt | r_logger | llm_router
 #print(result.tool_calls[0]["args"])
 #____________________________________________________________________________________________________________________________________________________
 
-
-
-
-
-
 # LINK TOOLS TOGETHER WITH LANGGRAPH:
 #____________________________________________________________________________________________________________________________________________________
 class GraphState(TypedDict):
@@ -518,10 +275,6 @@ class GraphState(TypedDict):
     k: NotRequired[int]
     route_after_check: NotRequired[str]
 #____________________________________________________________________________________________________________________________________________________
-
-
-
-
 
 # BUILD GRAPH NODES:
 #____________________________________________________________________________________________________________________________________________________
@@ -564,8 +317,6 @@ def route_question_node(state: dict) -> dict:
 
     logger.info(f"  Routing decision: {routes}")
     return {"routes": routes}
-
-
 
 # Build the retrieval node
 def extract_project_id(question: str) -> str | None:
@@ -611,8 +362,6 @@ def semantic_retrieve_w_scores(state: dict) -> dict:
     logger.info(f"Retrieved {len(all_docs)} documents across {len(stores)} stores")
     return {"documents": all_docs}
 
-
-
 semantic_retriever = RunnableLambda(
     semantic_retrieve_w_scores,
     name="semantic_retriever"
@@ -653,7 +402,6 @@ Answer using only the retrived documents.""")
     ])
     .with_config(run_name="RAG_Prompt_Template")
 )
-
 
 # Build generation node
 def generate_response(state: dict) -> dict:
@@ -762,12 +510,6 @@ def check_answer_node(state: dict) -> dict:
 
 #____________________________________________________________________________________________________________________________________________________
 
-
-
-
-
-
-
 # BUILD GRAPH EDGES:
 #____________________________________________________________________________________________________________________________________________________
 # Route Question Edge
@@ -779,11 +521,6 @@ def route_question_edge(state: dict) -> str:
 def decide_after_check(state: dict) -> str:
     return state.get("route_after_check", "final")
 #____________________________________________________________________________________________________________________________________________________
-
-
-
-
-
 
 # BUILD WORKFLOW:
 #____________________________________________________________________________________________________________________________________________________
@@ -830,16 +567,7 @@ workflow.add_conditional_edges("check_answer",
 # Compile the graph
 app = workflow.compile()
 
-# Display Graph
-display(Image(app.get_graph().draw_mermaid_png()))
 #____________________________________________________________________________________________________________________________________________________
-
-
-
-
-
-
-
 # EVALUATE:
 #____________________________________________________________________________________________________________________________________________________
 # Wrap app.invoke to match the expected interface (takes string, returns string)
@@ -847,25 +575,128 @@ agent_as_chain = RunnableLambda(
     lambda question: app.invoke({"question": question, "k": 6})["generation"]
 )
 
-eval_rag_chain_proj_query(agent_as_chain, q_num=15)
+# Suppress debug logging during eval
+logging.getLogger("agentic_workflow").setLevel(logging.WARNING)
+warnings.filterwarnings("ignore", category=UserWarning)
 
-# Test a "multi-part" question. For now, just want to verify that it selects multiple routes:
-print("\n\n=== MANUAL MULTI-PART TESTS ===")
+num_qa_runs    = 30
+num_multi_runs = 5
 
-test_questions = [
-    "What was the justification for project P738, and how should its Mission Alignment score change under the updated POM28 guidance?",
-    "Summarize the scope of project RM16-0799 and explain how it aligns with the POM26 National Defense Strategy themes.",
-    "Provide the CWE and justification for project NF20-0826, and compare how its Readiness Support score would be interpreted under POM26 versus POM28 criteria.",
-    "How do the definitions of Operational Cost differ between POM26 and POM28 scoring guidance?"
-]
+def run_qa(_):
+    # now returns (accuracy, missed_questions)
+    return eval_rag_chain_proj_query(agent_as_chain, q_num=10, verbose=False)
 
-for q in test_questions:
-    print("\n--- QUESTION ---")
-    print(q)
-    result = app.invoke({"question": q, "k": 6})
-    print("\n--- ROUTES SELECTED ---")
-    print(result.get("routes", "<no routes>"))
-    print("\n--- ANSWER ---")
-    print(result["generation"])
-    print("\n-------------------------")
+def run_multi(_):
+    return eval_multi_part_routing(app, k=6, verbose=False)
+
+with ThreadPoolExecutor(max_workers=8) as executor:
+    qa_futures    = [executor.submit(run_qa,    i) for i in range(num_qa_runs)]
+    multi_futures = [executor.submit(run_multi, i) for i in range(num_multi_runs)]
+
+    qa_results_raw  = [f.result() for f in qa_futures]
+    multi_part_list = [f.result() for f in multi_futures]
+
+# ---- unpack QA results ----
+qa_accuracies  = [r[0] for r in qa_results_raw]
+qa_miss_counts = defaultdict(int)
+for _, missed in qa_results_raw:
+    for q in missed:
+        qa_miss_counts[q] += 1
+
+# ---- unpack routing results ----
+multi_part_results = {}
+run_accuracies     = []
+q_pass_counts      = defaultdict(int)
+
+for run, multi_result in enumerate(multi_part_list):
+    multi_part_results[run] = multi_result
+    run_accuracy = sum(r["passed"] for r in multi_result.values()) / len(multi_result)
+    run_accuracies.append(run_accuracy)
+    for q_key, res in multi_result.items():
+        if res["passed"]:
+            q_pass_counts[q_key] += 1
+
+# ---- summary ----
+print(f"\n{'='*70}")
+print(f"  RESULTS — QA over {num_qa_runs} runs, Routing over {num_multi_runs} runs")
+print(f"{'='*70}")
+
+print(f"\nQA Accuracy")
+print(f"  Mean  : {np.mean(qa_accuracies):.2%}")
+print(f"  Stdev : {np.std(qa_accuracies):.2%}")
+print(f"  Min   : {np.min(qa_accuracies):.2%}")
+print(f"  Max   : {np.max(qa_accuracies):.2%}")
+
+print(f"\nMost Missed QA Questions  (out of {num_qa_runs} runs)")
+if qa_miss_counts:
+    for q, count in sorted(qa_miss_counts.items(), key=lambda x: -x[1]):
+        print(f"  {count:>3}x  {q}")
+else:
+    print("  None — all questions answered correctly across all runs")
+
+print(f"\nRouting Accuracy")
+print(f"  Mean  : {np.mean(run_accuracies):.2%}")
+print(f"  Stdev : {np.std(run_accuracies):.2%}")
+print(f"  Min   : {np.min(run_accuracies):.2%}")
+print(f"  Max   : {np.max(run_accuracies):.2%}")
+
+print(f"\nPer-Question Routing Pass Rate  (out of {num_multi_runs} runs)")
+for q_key in sorted(MULTI_PART_QUESTIONS.keys()):
+    count = q_pass_counts.get(q_key, 0)
+    print(f"  {q_key:<45}  {count}/{num_multi_runs}  ({count/num_multi_runs:.0%})")
+
+missed_routing = [q for q in sorted(MULTI_PART_QUESTIONS.keys()) if q_pass_counts.get(q, 0) == 0]
+if missed_routing:
+    print(f"\nNever passed routing:")
+    for q in missed_routing:
+        print(f"  {q}  (expected: {sorted(EXPECTED_ROUTES[q])})")
 #____________________________________________________________________________________________________________________________________________________
+
+# BUILD WORKFLOW:
+#____________________________________________________________________________________________________________________________________________________
+
+# # Display Graph
+# display(Image(app.get_graph().draw_mermaid_png()))
+
+with open("outputs/graph.png", "wb") as f:
+    f.write(app.get_graph().draw_mermaid_png())
+
+export_eval_summary_png(                                               
+    qa_accuracies=qa_accuracies,                                       
+    run_accuracies=run_accuracies,                                     
+    q_pass_counts=q_pass_counts,                                       
+    qa_miss_counts=qa_miss_counts,                                     
+    multi_part_questions=MULTI_PART_QUESTIONS,                         
+    expected_routes=EXPECTED_ROUTES,                                   
+    num_multi_runs=num_multi_runs,                                     
+    num_qa_questions=10,                                               
+    output_path="outputs/eval_summary.png",                                    
+)   
+
+timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+# QA per-run
+with open(f"outputs/qa_results_{timestamp}.csv", "w", newline="") as f:
+    writer = csv.DictWriter(f, fieldnames=["run", "accuracy"])
+    writer.writeheader()
+    writer.writerows([{"run": i, "accuracy": acc} for i, acc in enumerate(qa_accuracies)])
+
+# Missed QA questions
+with open(f"outputs/qa_missed_{timestamp}.csv", "w", newline="") as f:
+    rows = [{"question": q, "miss_count": count, "runs": num_qa_runs,
+             "miss_rate": count / num_qa_runs}
+            for q, count in sorted(qa_miss_counts.items(), key=lambda x: -x[1])]
+    writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+    writer.writeheader()
+    writer.writerows(rows)
+
+# Routing per-question
+with open(f"outputs/routing_results_{timestamp}.csv", "w", newline="") as f:
+    rows = [{"question": q, "passes": q_pass_counts.get(q, 0), "runs": num_multi_runs,
+             "pass_rate": q_pass_counts.get(q, 0) / num_multi_runs,
+             "expected_routes": "|".join(sorted(EXPECTED_ROUTES[q]))}
+            for q in sorted(MULTI_PART_QUESTIONS.keys())]
+    writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+    writer.writeheader()
+    writer.writerows(rows)
+
