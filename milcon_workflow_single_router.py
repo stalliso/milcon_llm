@@ -593,8 +593,8 @@ with ThreadPoolExecutor(max_workers=8) as executor:
     qa_futures    = [executor.submit(run_qa,    i) for i in range(num_qa_runs)]
     multi_futures = [executor.submit(run_multi, i) for i in range(num_multi_runs)]
 
-    qa_results_raw  = [f.result() for f in qa_futures]
-    multi_part_list = [f.result() for f in multi_futures]
+    qa_results_raw  = [f.result() for f in tqdm(qa_futures,    desc="QA runs",      unit="run")]
+    multi_part_list = [f.result() for f in tqdm(multi_futures, desc="Routing runs",  unit="run")]
 
 # ---- unpack QA results ----
 qa_accuracies  = [r[0] for r in qa_results_raw]
