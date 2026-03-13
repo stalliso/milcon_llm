@@ -227,6 +227,65 @@ def load_resources():
     strat28_vs = load_vectorstore("./databases/strat28", embedding_function=embedding_function)
     return embedding_function, proj_vs, strat26_vs, strat28_vs
 
+
+@st.cache_resource
+def load_project_dataframe(_proj_vectorstore):
+    """Pull all chunks from Chroma and merge them per project_id, including scores from page_content."""
+    collection = _proj_vectorstore._collection
+    results = collection.get(include=["documents", "metadatas"])
+    
+    from collections import defaultdict
+    project_chunks = defaultdict(list)
+    
+    for doc_str, meta in zip(results["documents"], results["metadatas"]):
+        pid = meta.get("project_id")
+        if not pid:
+            continue
+        
+        # Start with metadata fields
+        merged_chunk = dict(meta)
+        
+        # Parse the page_content JSON to get ALL fields including scores
+        try:
+            parsed = json.loads(doc_str)
+            if isinstance(parsed, dict):
+                for key, val in parsed.items():
+                    # Only add if not already in metadata or if richer value
+                    if key not in merged_chunk or merged_chunk[key] is None:
+                        merged_chunk[key] = val
+        except (json.JSONDecodeError, TypeError):
+            pass
+        
+        project_chunks[pid].append(merged_chunk)
+    
+    # Merge all chunks per project — fill in missing fields from later chunks
+    rows = []
+    for pid, chunks in project_chunks.items():
+        merged = {}
+        for chunk in chunks:
+            for key, val in chunk.items():
+                if key not in merged or merged[key] is None or merged[key] == "":
+                    merged[key] = val
+        rows.append(merged)
+    
+    df = pd.DataFrame(rows)
+    print(f"[DataFrame] Built {len(df)} unique projects from {sum(len(v) for v in project_chunks.values())} chunks")
+    print(f"[DEBUG] proj_df columns: {list(df.columns)}")
+    
+    # Show scoring columns specifically
+    score_cols = [c for c in df.columns if any(k in c.lower() for k in 
+                  ['mission', 'severity', 'readiness', 'operational', 'score', 'alignment'])]
+    print(f"[DEBUG] Scoring columns found: {score_cols}")
+    print(f"[DEBUG] sample row keys: {list(df.iloc[0].to_dict().keys()) if len(df) > 0 else 'empty'}")
+    
+    return df
+
+# Call it right after load_resources()
+baseline_hfe, proj_vectorstore, strat26_vectorstore, strat28_vectorstore = load_resources()
+proj_df = load_project_dataframe(proj_vectorstore) 
+print("[DEBUG] proj_df columns:", list(proj_df.columns))
+print("[DEBUG] sample row:", proj_df.iloc[0].to_dict())
+
 @st.cache_resource
 def build_llm_clients():
             ########## ROUTER MODEL ##########
@@ -275,7 +334,6 @@ def build_llm_clients():
     grader_chain = grader_prompt | llm_grader | StrOutputParser()
     return llm_md_tools, llm_gen_tools, grader_chain
 
-baseline_hfe, proj_vectorstore, strat26_vectorstore, strat28_vectorstore = load_resources()
 llm_md_tools, llm_gen_tools, grader_chain = build_llm_clients()
 
 # Setup logging for tool creation and testing
@@ -315,7 +373,66 @@ def run_llm_intro(user_msg: str, history: list):
     Returns:
         string: LLM's response to the user's inputs (comes from a ChatCompletion object)
     """    
+    AGGREGATE_KEYWORDS = [
+        "how many",
+        "count",
+        "total cost",
+        "total amount",
+        "total cwe",
+        "combined cost",
+        "sum of",
+        "list all",
+        "show all",
+        "all projects",
+        "which projects",
+        "average cost",
+        "avg cost",
+        "projects in",       # catches "projects in greece and italy"
+        "projects across",
+    ]
 
+    # Phrases that should NEVER go to pandas even if they contain aggregate keywords
+    SPECIFIC_PROJECT_PATTERNS = [
+        r'\b(P\d{3,4}|RM\d{2}-\d{4}|NF\d{2}-\d{4}|ST\d{2}-\d{4}|B\d{3,4})\b',  # specific project ID
+    ]
+
+    NARRATIVE_KEYWORDS = [
+        "justification",
+        "justify",
+        "explain",
+        "why",
+        "how does",
+        "align with",
+        "strategy",
+        "strategic",
+        "guidance",
+        "scope",
+        "impact",
+        "description",
+        "what is the",
+        "tell me about",
+        "summarize",
+    ]
+
+    def is_aggregate_query(question: str) -> bool:
+        """Return True only for dataset-wide summary/count/filter queries."""
+        # Extract just the current question (strip conversation history)
+        if "Current question:" in question:
+            q = question.split("Current question:")[-1].strip().lower()
+        else:
+            q = question.lower()
+
+        # Never aggregate if asking about a specific project ID
+        for pattern in SPECIFIC_PROJECT_PATTERNS:
+            if re.search(pattern, q, re.IGNORECASE):
+                return False
+
+        # Never aggregate if question is narrative/explanatory
+        if any(kw in q for kw in NARRATIVE_KEYWORDS):
+            return False
+
+        # Only aggregate if a clear summary keyword is present
+        return any(kw in q for kw in AGGREGATE_KEYWORDS)
 
     # create logging runnable to track router chain execution
     def logging_helper(state: dict) -> dict:
@@ -436,24 +553,179 @@ def run_llm_intro(user_msg: str, history: list):
         """Determine routing decision and persist it in state"""
         logger.info("NODE: Route Question - Determining data source")
 
-        question = state["question"]
-        logger.debug(f"  Question to route: {question}")
+        full_question = state["question"]
 
-        result = router_chain.invoke({"query": question})
+        # Extract just the current question for routing
+        if "Current question:" in full_question:
+            current_q = full_question.split("Current question:")[-1].strip()
+        else:
+            current_q = full_question
+
+        # Detect POM28 re-score/update requests and inject context for router
+        POM28_KEYWORDS = [
+            "pom28", "pom 28", "update this", "rewrite this", "update description",
+            "under pom28", "using pom28", "new guidance", "updated guidance",
+            "re-score", "rescore", "estimate under"
+        ]
+        POM26_KEYWORDS = [
+            "pom26", "pom 26", "existing guidance", "original guidance",
+            "as scored", "current score"
+        ]
+
+        # Build an enriched routing query that includes relevant context
+        if any(kw in current_q.lower() for kw in POM28_KEYWORDS):
+            # Force include strat28 by appending context to routing query
+            routing_query = f"{current_q}\n\n[NOTE: This question requires POM28 strategy guidance to answer.]"
+            logger.info("  Detected POM28 update/rescore request — injecting strat28 hint")
+        elif any(kw in current_q.lower() for kw in POM26_KEYWORDS):
+            routing_query = f"{current_q}\n\n[NOTE: This question requires POM26 strategy guidance to answer.]"
+            logger.info("  Detected POM26 alignment request — injecting strat26 hint")
+        else:
+            routing_query = current_q
+
+        logger.debug(f"  Question to route: {routing_query}")
+
+        result = router_chain.invoke({"query": routing_query})
         routes = result.tool_calls[0]["args"]["routes"]
+
+        # Safety net: if current question has POM28 keywords but router missed strat28, add it
+        if any(kw in current_q.lower() for kw in POM28_KEYWORDS):
+            if "strat28_vectorstore" not in routes:
+                routes.append("strat28_vectorstore")
+                logger.info("  Safety net: added strat28_vectorstore to routes")
+        if any(kw in current_q.lower() for kw in POM26_KEYWORDS):
+            if "strat26_vectorstore" not in routes:
+                routes.append("strat26_vectorstore")
+                logger.info("  Safety net: added strat26_vectorstore to routes")
+
+        # Also ensure proj_vectorstore is always included when a project ID is in history
+        project_id = extract_project_id_from_history(full_question)
+        if project_id and "proj_vectorstore" not in routes:
+            routes.append("proj_vectorstore")
+            logger.info(f"  Safety net: added proj_vectorstore for project {project_id}")
 
         logger.info(f"  Routing decision: {routes}")
         return {"routes": routes}
 
+    def pandas_query_node(state: dict) -> dict:
+        logger.info("NODE: Pandas Aggregate Query")
+        question = state["question"]
+
+        # Pre-defined helper injected into exec scope
+        def get_score(x):
+            if isinstance(x, dict):
+                return x.get("score")
+            try:
+                v = float(x)
+                return int(v) if v == int(v) else v
+            except (TypeError, ValueError):
+                return None
+
+        # Find all scoring columns that actually exist
+        score_cols = [c for c in proj_df.columns if "mission" in c.lower()
+                    or "alignment" in c.lower()
+                    or "severity" in c.lower()
+                    or "readiness" in c.lower()
+                    or "operational" in c.lower()
+                    or "score" in c.lower()]
+
+        schema_info = f"""
+        You have a pandas DataFrame called `proj_df` with {len(proj_df)} rows.
+
+        ACTUAL columns: {list(proj_df.columns)}
+
+        SCORING columns (all plain integers, -1 means not provided):
+        {score_cols}
+
+        KEY COLUMN NOTES:
+        - 'installation': ends in country code (' IT'=Italy, ' GR'=Greece, ' SP'=Spain, ' JA'=Japan, ' BH'=Bahrain)
+        - 'CWE': cost in THOUSANDS of dollars (100000 = $100M)
+        - SCORING COLUMNS ARE PLAIN INTEGERS — filter directly: proj_df['region_mission_alignment_score'] >= 3
+        - A value of -1 means score not provided — exclude with col > 0
+        - Do NOT define any functions — use direct pandas operations or lambdas only
+        - IMPORTANT: str.endswith() does NOT accept a list — use a tuple instead:
+        CORRECT:   proj_df['installation'].str.endswith((' IT', ' GR'))
+        INCORRECT: proj_df['installation'].str.endswith([' IT', ' GR'])
+        - For multiple countries, always use a tuple in str.endswith()
+        - 'project_id': string like 'P309', 'RM23-0509'
+        """
+
+        code_prompt = f"""
+    {schema_info}
+
+    Write Python/pandas code to answer this question: "{question}"
+
+    RULES:
+    - Store the final answer in a variable called `result`
+    - `result` must be a string — format it nicely using markdown
+    - For lists of projects, format as a markdown table with columns: | Project ID | Title | Installation |
+    - For simple counts or single values, return a plain string like "There are 5 projects in Italy."
+    - For mixed answers (count + list), combine: start with the count sentence, then the table
+    - Handle None/NaN safely with pd.notna() or isinstance() checks
+    - Do NOT import anything — pandas is available as `pd`
+    - Do NOT define any functions — use direct pandas operations or lambdas only
+    - Output ONLY the code, no explanation, no markdown fences
+
+    MARKDOWN TABLE FORMAT EXAMPLE:
+    result = "There are 3 projects in Italy.\\n\\n| Project ID | Title | Installation |\\n|---|---|---|\\n"
+    for _, row in filtered_df.iterrows():
+        result += f"| {{row['project_id']}} | {{row.get('title', 'N/A')}} | {{row.get('installation', 'N/A')}} |\\n"
+    """
+
+        response = llm_gen_tools.invoke([{"role": "user", "content": code_prompt}])
+        code = response.content.strip().removeprefix("```python").removeprefix("```").removesuffix("```").strip()
+
+        logger.debug(f"  Generated pandas code:\n{code}")
+
+        # Inject get_score helper so it's in scope even if LLM uses it anyway
+        local_vars = {"proj_df": proj_df.copy(), "pd": pd, "json": json, "get_score": get_score}
+
+        try:
+            exec(code, {}, local_vars)
+            result_str = str(local_vars.get("result", "Could not compute result."))
+        except KeyError as e:
+            score_cols = [c for c in proj_df.columns if "score" in c.lower()
+                        or "alignment" in c.lower() or "severity" in c.lower()]
+            result_str = (
+                f"Could not find the column {e} in the dataset. "
+                f"Available scoring-related columns are: {score_cols}. "
+                f"Try rephrasing your question using one of these field names."
+            )
+            logger.error(f"  KeyError: {e}\nCode:\n{code}")
+        except Exception as e:
+            result_str = f"Error running that query: `{e}`"
+            logger.error(f"  Pandas exec error: {e}\nCode:\n{code}")
+
+        logger.info(f"  Pandas result: {result_str[:200]}")
+        return {"generation": result_str}
 
 
     # Build the retrieval node
     def extract_project_id(question: str) -> str | None:
-        match = re.search(r'\b(P\d{3,4}|RM\d{2}-\d{4}|NF\d{2}-\d{4}|ST\d{2}-\d{4})\b', question, re.IGNORECASE)
-        return match.group(0).upper() if match else None  # normalize to uppercase
+        match = re.search(r'\b(P\d{3,4}|RM\d{2}-\d{4}|NF\d{2}-\d{4}|ST\d{2}-\d{4}|B\d{3,4})\b', question, re.IGNORECASE)
+        return match.group(0).upper() if match else None
+
+    def extract_project_id_from_history(question: str) -> str | None:
+        """
+        Extract project ID from conversation history when current question
+        uses a pronoun like 'it', 'this project', 'the project' without naming it.
+        Scans the full enriched question string (which includes history) for the
+        most recently mentioned project ID.
+        """
+        # Find ALL project IDs mentioned anywhere in the full question string
+        # (which includes conversation history when enriched)
+        all_matches = re.findall(
+            r'\b(P\d{3,4}|RM\d{2}-\d{4}|NF\d{2}-\d{4}|ST\d{2}-\d{4}|B\d{3,4})\b',
+            question,
+            re.IGNORECASE
+        )
+        if all_matches:
+            # Return the LAST mentioned project ID — most recent in conversation
+            return all_matches[-1].upper()
+        return None
 
     def semantic_retrieve_w_scores(state: dict) -> dict:
-        logger.info("NODE: Semantic Retrieve - Starting retrieval")  # ADD THIS
+        logger.info("NODE: Semantic Retrieve - Starting retrieval")
         routes = state.get("routes", [])
         full_question = state["question"]
         k = state.get("k", 6)
@@ -463,34 +735,46 @@ def run_llm_intro(user_msg: str, history: list):
         else:
             retrieval_query = full_question
 
+        # Try current question for explicit project ID first
         project_id = extract_project_id(retrieval_query)
+
+        # Only fall back to history if:
+        # - No project ID in current question
+        # - Current question is NOT an aggregate/country-level query
+        # - Current question uses a clear pronoun reference
+        PRONOUN_REFS = ["it ", "its ", "this project", "the project", "how does it", "how would it"]
+        is_pronoun_ref = any(p in retrieval_query.lower() for p in PRONOUN_REFS)
+
+        if not project_id and is_pronoun_ref and not is_aggregate_query(full_question):
+            project_id = extract_project_id_from_history(full_question)
+            if project_id:
+                logger.info(f"  project_id resolved from history: {project_id}")
+
         filter_dict = {"project_id": {"$eq": project_id}} if project_id else None
-        logger.info(f"  project_id extracted: {project_id}, filter: {filter_dict}")  # ADD THIS
+        logger.info(f"  project_id extracted: {project_id}, filter: {filter_dict}")
 
         store_map = {
             "proj_vectorstore": proj_vectorstore,
             "strat26_vectorstore": strat26_vectorstore,
-            "strat28_vectorstore": strat28_vectorstore 
+            "strat28_vectorstore": strat28_vectorstore
         }
 
         stores = [store_map[r] for r in routes if r in store_map]
-        logger.info(f"  Stores to query: {[r for r in routes if r in store_map]}")  # ADD THIS
+        logger.info(f"  Stores to query: {[r for r in routes if r in store_map]}")
 
         if not stores:
             return {"documents": []}
 
         all_docs = []
-
         for store in stores:
             filt = filter_dict if store is proj_vectorstore else None
-            logger.info(f"  Querying store with filter: {filt}")  # ADD THIS
+            logger.info(f"  Querying store with filter: {filt}")
             docs = store.similarity_search_with_relevance_scores(
-                retrieval_query,
-                k=k,
-                filter=filt
+                retrieval_query, k=k, filter=filt
             )
-            logger.info(f"  Got {len(docs)} docs from store")  # ADD THIS
+            logger.info(f"  Got {len(docs)} docs from store")
             all_docs.extend(docs)
+
         return {"documents": all_docs}
 
 
@@ -508,30 +792,41 @@ def run_llm_intro(user_msg: str, history: list):
     - Project documents: scope, cost, justification, scoring, facility details.
     - POM26 strategy/policy: NSS/NDS themes and original CNIC scoring criteria.
     - POM28 strategy/policy: updated NSS/NDS themes and revised CNIC scoring criteria.
-    - Facility criteria documents: definitions and scoring rules for PDS categories.
 
     GROUNDING RULES
     - Treat the retrieved documents as the authoritative source for all project, facility, and strategy content.
     - Do not invent or infer information that is not supported by the documents or tool outputs.
-    - Documents are JSON-formatted and contain fields like installation (the project's location/base), title, region, scope, CWE (cost), COCOM, and scoring fields — use these fields to answer questions.
-    - Project IDs like "P314", "RM16-0799", "NF22-1234" refer to the "project_id" field in the documents. When a user asks about "P314", they mean the document where project_id = "P314". Similarly, if asked p314 or rm16-0799, it still refers to the same project_id field in the documents - just normalized to uppercase.
-    - The "installation" field is the physical location of the project. If asked "where is" a project, answer using the installation name and infer the city/country if it is recognizable (e.g., "NAVSUPPACT NAPLES IT" = Naples, Italy).
-    - Scoring fields come in pairs: "region_<category>" and "lead_proponent_<category>" (e.g., region_mission_alignment and lead_proponent_mission_alignment). Each has a "score" and "description" subfield. A null value means no score or statement was provided.
+    - Documents are JSON-formatted and contain fields like installation, title, region, scope, CWE (cost), COCOM, and scoring fields.
+    - Project IDs like "P314", "RM16-0799" refer to the "project_id" field. Normalize to uppercase.
+    - The "installation" field is the physical location. Infer city/country if recognizable.
+    - Scoring fields come in pairs: "region_<category>" and "lead_proponent_<category>". Each has "score" and "description" subfields. Null = not provided.
 
-    MISSING‑EVIDENCE RULES
+    MISSING-EVIDENCE RULES
     - If no documents are retrieved and the question concerns Navy facilities projects, respond with "I don't know. No relevant project documents were retrieved to answer this question. Are you sure you have the correct project ID?"
-    - If no documents are retrieved and the question is general (not about Navy facilities), you may answer using general knowledge.
+    - If no documents are retrieved and the question is general, you may answer using general knowledge.
 
-    ANSWERING RULES
-    - Answer in 1-3 sentences. Be direct and concise.
-    - SCORING RULE: If the user asks for a score in a category without specifying "region" or "lead proponent", always report BOTH the region score and the lead proponent score. If either is null, state "not provided". Example: "The region mission alignment score is 4. No lead proponent score was provided."
-    - SCORING RULE: If the user specifies "region" or "lead proponent" explicitly, return only that one score.
-    - Never say "I don't know" if the documents contain any relevant information — extract and use what is there. If a field is null, say "not provided" rather than "I don't know".
-    - Cite the specific field or value you are drawing from (e.g., "According to the region_severity_statement field...").
-    - When multiple document domains are retrieved, integrate them into a single coherent answer.
-    - if askedabout a cost, or reporting CWE information, automatically convert to thousands of dollars (e.g. "CWE ($000) is $68140, or $68,140,000" rather than "68140"). If the CWE field is null, say "CWE information was not provided for this project."
+    ANSWERING RULES - EXISTING SCORES (POM26 / as-scored):
+    - If the user asks how a project aligns with POM26, or asks for existing scores/justifications,
+    report the scores and descriptions EXACTLY as stored in the document fields.
+    - Always report BOTH region and lead_proponent scores. If either is null, state "not provided".
+    - Cite the specific field you are drawing from (e.g., "According to region_mission_alignment_desc...").
+    - Format scores clearly: "Region Mission Alignment: 4 — [description]"
+
+    ANSWERING RULES - NEW SCORING UNDER POM28 (re-score requests):
+    - If the user asks how a project WOULD align, COULD score, or asks to RE-SCORE under POM28 guidance,
+    you are being asked to GENERATE a new estimated score and justification.
+    - Use the POM28 strategy documents retrieved to understand the updated NSS/NDS themes and scoring criteria.
+    - Use the project's scope, mission, and impact fields as the basis for the new justification.
+    - Clearly label your output as an ESTIMATED score under POM28, not the official recorded score.
+    - Format as: "**Estimated POM28 Score: [1-5]** — [justification referencing both the project details and POM28 themes]"
+    - If POM28 docs were not retrieved, say you cannot estimate without the POM28 guidance documents.
+
+    GENERAL RULES
+    - Answer in 3-6 sentences for alignment questions — these require more detail than simple factual lookups.
+    - if asked about cost or CWE, convert to dollars (e.g. CWE 68140 = $68,140,000).
     - When POM26 and POM28 guidance conflict, clearly distinguish between them.
-            """),
+    - Never say "I don't know" if the documents contain any relevant information.
+    """),
             ("human", """Retrieved Documents:
     {context}
 
@@ -624,6 +919,12 @@ def run_llm_intro(user_msg: str, history: list):
         attempts    = state.get("gen_attempts", 0)
         max_retries = state.get("max_retries", 3)
 
+        # Extract current question only (strip conversation history)
+        if "Current question:" in question:
+            current_q = question.split("Current question:")[-1].strip().lower()
+        else:
+            current_q = question.lower()
+
         # ---- IDK check ----
         if any(phrase.lower() in generation.lower() for phrase in idk_phrases):
             logger.info("  IDK detected")
@@ -640,7 +941,19 @@ def run_llm_intro(user_msg: str, history: list):
             logger.info("  Multiple choice answer found -> final")
             return {"route_after_check": "final"}
 
-        # ---- LLM grounding check for open-ended ----
+        # ---- Skip grader for generative/alignment questions ----
+        # These require synthesis across documents — grader will incorrectly reject
+        # valid answers because generated text won't match retrieved chunks verbatim
+        GENERATIVE_KEYWORDS = [
+            "align", "alignment", "strategy", "strategic", "pom26", "pom28",
+            "would", "could", "estimate", "re-score", "rescore", "justify",
+            "justification", "how does", "how would", "explain"
+        ]
+        if any(kw in current_q for kw in GENERATIVE_KEYWORDS):
+            logger.info("  Generative/alignment question detected — skipping grader, returning final")
+            return {"route_after_check": "final"}
+
+        # ---- LLM grounding check for open-ended factual questions ----
         context = "\n\n---\n\n".join([doc.page_content for doc, _ in documents[:4]])
         grade = grader_chain.invoke({
             "context":    context,
@@ -662,6 +975,10 @@ def run_llm_intro(user_msg: str, history: list):
     #____________________________________________________________________________________________________________________________________________________
     # Route Question Edge
     def route_question_edge(state: dict) -> str:
+        question = state.get("question", "")
+        if is_aggregate_query(question):
+            logger.info("EDGE: route_question_edge -> pandas_aggregate")
+            return "pandas_aggregate"
         logger.info("EDGE: route_question_edge -> retrieve")
         return "retrieve"
 
@@ -669,11 +986,6 @@ def run_llm_intro(user_msg: str, history: list):
     def decide_after_check(state: dict) -> str:
         return state.get("route_after_check", "final")
     #____________________________________________________________________________________________________________________________________________________
-
-
-
-
-
 
     # BUILD WORKFLOW:
     #____________________________________________________________________________________________________________________________________________________
@@ -683,6 +995,7 @@ def run_llm_intro(user_msg: str, history: list):
     # Add the appropriate nodes
     workflow.add_node("init_state", init_graph_state)
     workflow.add_node("route_question", route_question_node)
+    workflow.add_node("pandas_aggregate", pandas_query_node)  
     workflow.add_node("semantic_retriever_and_grader", semantic_retrieve_w_scores)
     workflow.add_node("generate_response", generate_response)
     workflow.add_node("check_answer", check_answer_node)
@@ -698,11 +1011,13 @@ def run_llm_intro(user_msg: str, history: list):
     workflow.add_conditional_edges("route_question", 
                     route_question_edge,
                     {
+                        "pandas_aggregate": "pandas_aggregate",
                         "retrieve": "semantic_retriever_and_grader" 
                     }
                     )
 
     # retrieve -> generate
+    workflow.add_edge("pandas_aggregate", END)  
     workflow.add_edge("semantic_retriever_and_grader", "generate_response")
 
 

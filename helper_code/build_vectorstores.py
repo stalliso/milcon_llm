@@ -9,39 +9,88 @@ from langchain_core.documents import Document
 from .parser import FormTextExtractor, get_pds
 
 
+def _flatten_metadata(project_id: str, project_data: dict, source: str) -> dict:
+    """
+    Flatten all project_data fields into a Chroma-compatible metadata dict.
+    Chroma only accepts scalar values (str, int, float, bool) — no dicts or lists.
+    Scoring fields are stored as _score (int) and _desc (str) pairs.
+    The facility_information table is stored as a JSON string.
+    """
+    meta = {
+        "source":               source,
+        "project_id":           project_id,
+        "title":                project_data.get("title") or "",
+        "installation":         project_data.get("installation") or "",
+        "CWE":                  project_data.get("CWE") or 0,
+        "CCN":                  project_data.get("CCN") or 0,
+        "region":               project_data.get("region") or "",
+        "lead_proponent":       project_data.get("lead_proponent") or "",
+        "COCOM":                project_data.get("COCOM") or "",
+        "scope":                project_data.get("scope") or "",
+        "impact_if_not_provided": project_data.get("impact_if_not_provided") or "",
+    }
+
+    # Flatten scoring fields — each is a dict with "score" (int) and "description" (str)
+    scoring_fields = [
+        "region_mission_alignment",
+        "lead_proponent_mission_alignment",
+        "region_readiness_support",
+        "lead_proponent_readiness_support",
+        "region_operational_cost",
+        "lead_proponent_operational_cost",
+        "region_severity_statement",
+        "lead_proponent_severity_statement",
+        "region_urgency_statement",
+        "lead_proponent_urgency_statement",
+    ]
+    for field in scoring_fields:
+        val = project_data.get(field)
+        if isinstance(val, dict):
+            meta[f"{field}_score"] = val.get("score")  if val.get("score")  is not None else -1
+            meta[f"{field}_desc"]  = val.get("description") or ""
+        else:
+            meta[f"{field}_score"] = -1
+            meta[f"{field}_desc"]  = ""
+
+    # Flatten RAC/ROI/PCI metrics
+    metrics = project_data.get("metrics") or {}
+    meta["RAC"] = str(metrics.get("RAC") or "")
+    meta["ROI"] = str(metrics.get("ROI") or "")
+    meta["PCI"] = str(metrics.get("PCI") or "")
+
+    # Store facility_information as JSON string (list of dicts can't go in metadata directly)
+    facility = project_data.get("facility_information") or []
+    meta["facility_information"] = json.dumps(facility)
+
+    return meta
+
+
 def build_vectorstores():
 
-    # Anchor all paths relative to this file, not the calling script
     base = Path.cwd()
 
     ########## PROJECT DATA SHEETS ##########
     directory = base / "docs/projects"
-    proj_doc_paths = [os.path.join(directory, filename) for filename in os.listdir(directory) if filename.endswith('.pdf')]
+    proj_doc_paths = [
+        os.path.join(directory, f)
+        for f in os.listdir(directory)
+        if f.endswith('.pdf')
+    ]
 
     proj_docs_flat = []
     for doc_path in proj_doc_paths:
         try:
-            boxes = FormTextExtractor(doc_path).extract_boxes()
-            pds_dict = get_pds(boxes)
-            project_id = list(pds_dict.keys())[0]
+            boxes        = FormTextExtractor(doc_path).extract_boxes()
+            pds_dict     = get_pds(boxes)
+            project_id   = list(pds_dict.keys())[0]
             project_data = pds_dict[project_id]
+
             doc = Document(
                 page_content=json.dumps(project_data, indent=2),
-                metadata={
-                    "source": doc_path,
-                    "project_id": project_id,
-                    "title": project_data.get("title"),
-                    "installation": project_data.get("installation"),
-                    "CWE": project_data.get("CWE"),
-                    "CCN": project_data.get("CCN"),
-                    "region": project_data.get("region"),
-                    "lead_proponent": project_data.get("lead_proponent"),
-                    "COCOM": project_data.get("COCOM"),
-                    "scope": project_data.get("scope"),
-                    "impact_if_not_provided": project_data.get("impact_if_not_provided")
-                }
+                metadata=_flatten_metadata(project_id, project_data, doc_path)
             )
             proj_docs_flat.append(doc)
+
         except Exception as e:
             print(f"Error processing {doc_path}: {type(e).__name__} - {e}")
 
@@ -84,17 +133,15 @@ def build_vectorstores():
         persist_directory=str(base / "databases/proj"),
         ids=[doc.metadata["id"] for doc in recursive_proj_docs]
     )
-    recursive_chunk_vectorstore_strat26 = Chroma.from_documents(
+    Chroma.from_documents(
         documents=recursive_strat26_docs,
         embedding=baseline_hfe,
         persist_directory=str(base / "databases/strat26"),
         ids=[doc.metadata["id"] for doc in recursive_strat26_docs]
     )
-    recursive_chunk_vectorstore_strat28 = Chroma.from_documents(
+    Chroma.from_documents(
         documents=recursive_strat28_docs,
         embedding=baseline_hfe,
         persist_directory=str(base / "databases/strat28"),
         ids=[doc.metadata["id"] for doc in recursive_strat28_docs]
     )
-
-    

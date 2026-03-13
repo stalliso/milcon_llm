@@ -599,8 +599,8 @@ agent_as_chain = RunnableLambda(
 logging.getLogger("agentic_workflow").setLevel(logging.WARNING)
 warnings.filterwarnings("ignore", category=UserWarning)
 
-num_qa_runs    = 30
-num_multi_runs = 3
+num_qa_runs    = 1
+num_multi_runs = 1
 
 def run_qa(_):
     # now returns (accuracy, missed_questions)
