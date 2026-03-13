@@ -16,6 +16,7 @@ def export_eval_summary_png(
     num_multi_runs: int,
     num_qa_questions: int = 10,
     output_path: str = "eval_summary.png",
+    layout: str = "standard",   # "standard" or "wide"
 ):
     """
     Export eval results summary table to PNG.
@@ -81,7 +82,12 @@ def export_eval_summary_png(
     # ------------------------------------------------------------------ #
     #  Layout constants (all in inches)                                    #
     # ------------------------------------------------------------------ #
-    FIG_W     = 13.0
+    if layout == "wide":
+        FIG_W = 20.0   # 16:9 PowerPoint aspect (~10" tall at this width)
+        DPI   = 150
+    else:
+        FIG_W = 13.0   # original
+        DPI   = 180
     MARGIN_L  = 0.35
     MARGIN_R  = 0.35
     CONTENT_W = FIG_W - MARGIN_L - MARGIN_R
