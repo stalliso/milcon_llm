@@ -188,12 +188,56 @@ st.markdown("---")                    # Horizontal rule separator
 # DESCRIPTION OF DASHBOARD PAGES
 # --------------------------------------
 
-st.markdown(
-    """
-    ### Dashboard Overview
-    """,
-    unsafe_allow_html=True              # Render HTML safely - not plain text
-)
+st.markdown("""
+### Dashboard Overview
+
+This dashboard provides an AI-powered interface for exploring **MILCON** (Military Construction) 
+and **FSRM** (Facilities Sustainment, Restoration, and Modernization) project data for the 
+**CNIC Navy Region Europe, Africa, and Southwest Asia (CNR EU)**.
+
+---
+
+#### 📁 Data Sources
+The assistant draws from three document domains:
+
+| Domain | Description |
+|---|---|
+| **Project Data Sheets (PDS)** | Individual project datasheets including scope, cost (CWE), location, facility details, and scoring justifications |
+| **POM26 Strategic Guidance** | NSS/NDS themes, CNIC scoring criteria, and PDS scoring definitions as established during POM26 |
+| **POM28 Strategic Guidance** | Updated NSS/NDS themes, revised CNIC scoring criteria, and new scoring definitions for POM28 |
+
+---
+
+#### 💬 What You Can Ask
+The assistant supports two types of queries:
+
+**Project-Specific Questions**
+- Retrieve scope, cost, location, or facility details for a specific project
+- Report existing mission alignment, readiness support, operational cost, severity, and urgency scores
+- Explain how a project aligns with POM26 strategic guidance
+- Estimate how a project *would* score under updated POM28 guidance
+
+**Dataset Summary Questions**
+- Count or list projects by country, installation, or region
+- Filter projects by score thresholds (e.g., mission alignment ≥ 4)
+- Calculate total or average costs across countries or regions
+- Compare project portfolios across multiple locations
+
+---
+
+#### 🔍 Example Questions
+- *"List all projects in Italy with a region mission alignment score of 4"*
+- *"What is the total cost of all projects in Greece and Spain?"*
+- *"What is the scope and impact of P309?"*
+- *"How does P740 align with POM26 guidance?"*
+- *"How would RM23-0514 score under POM28 strategic guidance?"*
+- *"How many projects have a readiness support score below 3?"*
+
+---
+
+> ⚠️ **Coverage Note:** This tool currently covers **NAVEUR/NAVAF projects only**.  
+> Project IDs follow the format `P###`, `RM##-####`, `NF##-####`, or `ST##-####`.
+""", unsafe_allow_html=True)
 
 # --------------------------------------
 # LLM HELPER FUNCTIONS
