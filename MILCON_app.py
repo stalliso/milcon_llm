@@ -233,10 +233,6 @@ The assistant supports two types of queries:
 - *"How would RM23-0514 score under POM28 strategic guidance?"*
 - *"How many projects have a readiness support score below 3?"*
 
----
-
-> ⚠️ **Coverage Note:** This tool currently covers **NAVEUR/NAVAF projects only**.  
-> Project IDs follow the format `P###`, `RM##-####`, `NF##-####`, or `ST##-####`.
 """, unsafe_allow_html=True)
 
 # --------------------------------------
@@ -643,10 +639,27 @@ def run_llm_intro(user_msg: str, history: list):
                 logger.info("  Safety net: added strat26_vectorstore to routes")
 
         # Also ensure proj_vectorstore is always included when a project ID is in history
-        project_id = extract_project_id_from_history(full_question)
-        if project_id and "proj_vectorstore" not in routes:
-            routes.append("proj_vectorstore")
-            logger.info(f"  Safety net: added proj_vectorstore for project {project_id}")
+        # Only skip history-based proj_vectorstore injection if:
+        # 1. The current question is about strategy/policy AND
+        # 2. There is NO specific project ID in the current question itself
+        current_project_id = extract_project_id(current_q)
+
+        PURE_STRATEGY_KEYWORDS = [
+            "national security strategy", "nss", "nds", "national defense strategy",
+            "key focus areas", "strategic themes", "pom26 strategy", "pom28 strategy",
+            "cnic scoring", "scoring criteria", "scoring definitions"
+        ]
+
+        is_pure_strategy = (
+            any(kw in current_q.lower() for kw in PURE_STRATEGY_KEYWORDS)
+            and current_project_id is None  # only pure strategy if no project ID present
+        )
+
+        if not is_pure_strategy:
+            project_id = extract_project_id_from_history(full_question)
+            if project_id and "proj_vectorstore" not in routes:
+                routes.append("proj_vectorstore")
+                logger.info(f"  Safety net: added proj_vectorstore for project {project_id}")
 
         logger.info(f"  Routing decision: {routes}")
         return {"routes": routes}
@@ -779,13 +792,10 @@ def run_llm_intro(user_msg: str, history: list):
         else:
             retrieval_query = full_question
 
-        # Try current question for explicit project ID first
+        # Resolve project ID BEFORE any query rewrite
+        # so pronoun references ("it", "the project") are resolved from history
         project_id = extract_project_id(retrieval_query)
 
-        # Only fall back to history if:
-        # - No project ID in current question
-        # - Current question is NOT an aggregate/country-level query
-        # - Current question uses a clear pronoun reference
         PRONOUN_REFS = ["it ", "its ", "this project", "the project", "how does it", "how would it"]
         is_pronoun_ref = any(p in retrieval_query.lower() for p in PRONOUN_REFS)
 
@@ -794,8 +804,41 @@ def run_llm_intro(user_msg: str, history: list):
             if project_id:
                 logger.info(f"  project_id resolved from history: {project_id}")
 
+        # If a project was resolved (either directly or from history),
+        # make sure proj_vectorstore is in routes
+        if project_id and "proj_vectorstore" not in routes:
+            routes = list(routes) + ["proj_vectorstore"]
+            logger.info(f"  Safety net: added proj_vectorstore for {project_id}")
+
+        # NOW apply query rewrite for NSS/NDS — after project ID is resolved
+        # NOW apply query rewrite for NSS/NDS — after project ID is resolved
+        q_lower = retrieval_query.lower()
+        full_q_lower = full_question.lower()
+
+        # Determine which POM era is being asked about
+        is_pom28_context = any(kw in q_lower for kw in [
+            "pom28", "pom 28", "updated", "new guidance", "updated guidance"
+        ]) or any(kw in full_q_lower.split("current question:")[-1].lower() for kw in [
+            "pom28", "pom 28"
+        ])
+
+        if any(kw in q_lower for kw in ["nss", "national security strategy"]):
+            if is_pom28_context:
+                retrieval_query = "2025 national security strategy america first priorities strength deterrence"
+                logger.info("  NSS query rewrite applied (POM28 context)")
+            else:
+                retrieval_query = "national security strategy priorities competition democracy alliances"
+                logger.info("  NSS query rewrite applied (POM26 context)")
+        elif any(kw in q_lower for kw in ["nds", "national defense strategy"]):
+            if is_pom28_context:
+                retrieval_query = "2026 national defense strategy military strength deterrence homeland"
+                logger.info("  NDS query rewrite applied (POM28 context)")
+            else:
+                retrieval_query = "national defense strategy military deterrence threats integrated"
+                logger.info("  NDS query rewrite applied (POM26 context)")
+
         filter_dict = {"project_id": {"$eq": project_id}} if project_id else None
-        logger.info(f"  project_id extracted: {project_id}, filter: {filter_dict}")
+        logger.info(f"  project_id: {project_id}, filter: {filter_dict}")
 
         store_map = {
             "proj_vectorstore": proj_vectorstore,
@@ -1092,10 +1135,12 @@ def run_llm_intro(user_msg: str, history: list):
 
     result = app.invoke({"question": enriched_question})
 
+    # At the bottom of run_llm_intro, replace the return statement:
     generation = result.get("generation", "I don't know.")
-    # Strip reasoning model <think> blocks
     generation = re.sub(r'<think>.*?</think>', '', generation, flags=re.DOTALL).strip()
-    return generation
+    documents  = result.get("documents", [])
+
+    return generation, documents  # <-- return both
 
 # --------------------------------------
 # CHAT ASSISTANT UI
@@ -1134,17 +1179,40 @@ else:                                       # If the LLM is configured
         # Here's the critical part - call the LLM API with the user's message, 
         # the filtered df, & the prior chat history for context
         with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):                     # Show a "thinking" spinner while waiting for LLM response
+            with st.spinner("Thinking..."):
                 try:
-                    assistant_reply = run_llm_intro(            # Call our LLM helper function
-                        user_msg=user_msg,                      # User's message
-                        history=st.session_state.messages[:-1]  # Prior chat history - exclude current user message...
-                    )                                           # so it doesn't appear twice
-                
-                except Exception as e:                          # If there's an error calling the LLM API
+                    assistant_reply, source_docs = run_llm_intro(
+                        user_msg=user_msg,
+                        history=st.session_state.messages[:-1]
+                    )
+                except Exception as e:
                     assistant_reply = f"Sorry, I couldn't reach the LLM API: `{e}`"
+                    source_docs = []
 
-                st.markdown(assistant_reply)                    # Display the LLM's reply in the chat
+                st.markdown(assistant_reply)
+
+                # Show sources in collapsible expander
+                if source_docs:
+                    with st.expander("📄 Sources", expanded=False):
+                        seen = set()
+                        for doc, score in source_docs:
+                            pid = doc.metadata.get("project_id")
+                            title = doc.metadata.get("title", "")
+                            install = doc.metadata.get("installation", "")
+                            source_file = doc.metadata.get("source", "")
+                            filename = source_file.split("/")[-1] if source_file else "Unknown"
+
+                            # Use filename as identifier for strategy docs (no project_id)
+                            dedup_key = pid if pid else filename
+                            if dedup_key in seen:
+                                continue
+                            seen.add(dedup_key)
+
+                            if pid:
+                                st.markdown(f"**{pid}** — {title}  \n`{install}` | File: `{filename}`")
+                            else:
+                                # Strategy document — show filename as the reference
+                                st.markdown(f"📘 **{filename}**")
 
         # Save assistant reply to history
         st.session_state.messages.append(
