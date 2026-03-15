@@ -324,6 +324,11 @@ facility_row_keys = [
 single_row_data_order = [
     "Facility ID", "Predom CCN", "MDI", "PRV ($K)", "UM", "Work Type", "Quantity", "Cond Rtg", "Conf Rtg",
 ]
+# Extended for forms that put data first then headers, with Facility No. and Yr Blt (e.g. RM23-0513)
+single_row_data_order_extended = [
+    "Facility ID", "Predom CCN", "MDI", "PRV ($K)", "UM", "Work Type", "Quantity",
+    "Facility No.", "Cond Rtg", "Conf Rtg", "Yr Blt",
+]
 # Multi-row: 10 cells per row -> column index to key
 multi_row_cell_order = [
     "Facility ID", "RPA Name", "Predom CCN", "PRV ($K)", "Work Type", "Quantity", "UM", "MDI", "Cond Rtg", "Conf Rtg",
@@ -365,6 +370,95 @@ def get_region_boxes(boxes: List[TextBox], page: int, y_start: float, y_end: flo
         and "Facility Information" not in b.text
         and "PRV-Weighted" not in b.text
     ]
+
+
+def _line_looks_like_facility_data(ln: str) -> bool:
+    """True if line looks like a data value (facility ID or number), not a header."""
+    t = ln.strip()
+    if not t or len(t) < 2:
+        return False
+    lower = t.lower()
+    if lower in ("facility id", "facility no.", "rpa name", "predom", "ccn", "mdi", "prv ($k)", "um", "work", "type", "quantity", "cond", "rtg", "conf", "yr blt", "mtd"):
+        return False
+    if "facility" in lower or "predom" in lower or "rpa" in lower or "quantity" in lower:
+        return False
+    digits = "".join(c for c in t if c.isdigit())
+    if len(digits) >= 4 and "," not in t:
+        return True  # e.g. 121851, 9129.0
+    if len(t) >= 6 and any(c.isalpha() for c in t) and any(c.isdigit() for c in t):
+        return True  # e.g. NFA200000403234
+    if len(t) >= 2 and t.replace(".", "").replace(",", "").isdigit():
+        return True  # numeric with comma/period
+    return False
+
+
+def _find_data_first_facility_block(region_boxes: List[TextBox]) -> Optional[TextBox]:
+    """Find a box that contains 'Facility ID' and has data lines before the header labels (data-first layout)."""
+    for b in region_boxes:
+        if "Facility ID" not in b.text and "facility id" not in b.text.lower():
+            continue
+        lines = [ln.strip() for ln in b.text.splitlines() if ln.strip()]
+        seen_data = False
+        for ln in lines:
+            if _line_looks_like_facility_data(ln):
+                seen_data = True
+            if seen_data and (ln.lower() == "facility id" or "facility id" in ln.lower()):
+                return b  # we saw data then hit header
+    return None
+
+
+def _collect_rpa_name_from_region_boxes(region_boxes: List[TextBox], main_block: TextBox) -> str:
+    """Collect RPA Name from boxes below the main block (e.g. separate RPA Name / value cells)."""
+    tol = y_cluster_tolerance()
+    # Boxes strictly below the main block (or same y but we want to skip main)
+    parts = []
+    for b in region_boxes:
+        if b is main_block or b.y0 <= main_block.y0 + tol:
+            continue
+        for ln in b.text.splitlines():
+            t = ln.strip()
+            if not t or t.lower() in ("rpa name", "mtd", "facility id"):
+                continue
+            if _is_header_like_cell(t):
+                continue
+            if len(t) <= 2 and t.isdigit():
+                continue  # skip short numbers like 55 (Facility No.)
+            if len(t) == 1:
+                continue  # skip single chars (e.g. "R" from "R\n15KVOH\nMTD")
+            parts.append(t)
+    return " ".join(parts) if parts else ""
+
+
+def parse_data_first_single_facility(region_boxes: List[TextBox]) -> List[Dict[str, str]]:
+    """
+    Parse when one block has DATA first then HEADERS (e.g. RM23-0513).
+    Uses extended field order and collects RPA Name from other boxes.
+    """
+    main_block = _find_data_first_facility_block(region_boxes)
+    if main_block is None:
+        return []
+    lines = [ln.strip() for ln in main_block.text.splitlines() if ln.strip()]
+    header_set = facility_table_headers
+    data_lines = []
+    for ln in lines:
+        token = ln.lower()
+        if token in header_set or "facility id" in token or "facility no." in token or "predom" in token or "cond" in token or "conf" in token or token == "ccn" or token == "mdi" or "prv" in token or token == "um" or token == "work" or token == "type" or token == "quantity" or "rtg" in token or "yr blt" in token:
+            break
+        data_lines.append(ln)
+    if not data_lines:
+        return []
+    result_row = {k: "" for k in facility_row_keys}
+    order = single_row_data_order_extended
+    for i, key in enumerate(order):
+        if i < len(data_lines):
+            result_row[key] = data_lines[i].strip()
+    if len(data_lines) >= 9 and not result_row.get("Conf Rtg") and result_row.get("Cond Rtg"):
+        result_row["Conf Rtg"] = result_row["Cond Rtg"]
+    rpa = _collect_rpa_name_from_region_boxes(region_boxes, main_block)
+    if rpa:
+        result_row["RPA Name"] = rpa
+    return [result_row]
+
 
 def multi_row_parse(region_boxes: List[TextBox]) -> List[Dict[str, str]]:
     """Parse when table is laid out as separate boxes per cell (multiple rows)."""
@@ -420,6 +514,12 @@ def multi_row_parse(region_boxes: List[TextBox]) -> List[Dict[str, str]]:
             data_rows = data_rows[1:]
     if not data_rows:
         return []
+    # Drop rows that are entirely header-like (repeated header or subheader)
+    def row_is_header_like(r):
+        return all(_is_header_like_cell(cell.replace("\n", " ").strip()) for cell in r)
+    data_rows = [r for r in data_rows if not row_is_header_like(r)]
+    if not data_rows:
+        return []
     # Expand rows: if any cell has newlines, split into one row per line
     expanded_rows = expand_multiline_cells(data_rows)
     # Build row dicts using schema so Facility No. is blank and Predom CCN is one value
@@ -467,6 +567,98 @@ def cells_to_facility_row(cells: List[str], headers: List[str]) -> Dict[str, str
         if i < len(cells):
             d[key] = cells[i].replace("\n", " ").strip()
     return d
+
+
+# -----------------------------------------------------------------------------
+# Facility row validation (filter junk from inconsistent table layouts)
+# -----------------------------------------------------------------------------
+
+# Facility IDs are typically 5–6 digit numbers; row indices or page numbers are 1–2 digits
+_FACILITY_ID_MIN_DIGITS = 4
+# RPA Name should be descriptive text; numeric-only values are usually misplaced Quantity
+_NUMERIC_ONLY_RE = re.compile(r"^[\d,\s.]+$")
+
+
+def _looks_like_facility_id(value: str) -> bool:
+    """True if value looks like a real facility ID (e.g. 121379), not a row number or quantity."""
+    if not value or not value.strip():
+        return False
+    # Real IDs are plain digits (no comma); quantities are often "4,855" or "10,473"
+    if "," in value:
+        return False
+    digits = "".join(c for c in value if c.isdigit())
+    return len(digits) >= _FACILITY_ID_MIN_DIGITS
+
+
+def _rpa_name_looks_numeric(value: str) -> bool:
+    """True if RPA Name looks like a misplaced number (e.g. '3,880')."""
+    if not value or not value.strip():
+        return False
+    return bool(_NUMERIC_ONLY_RE.match(value.strip()))
+
+
+def _is_header_like_cell(text: str) -> bool:
+    """True if cell text looks like a column header, not data."""
+    t = text.strip().lower()
+    if not t:
+        return False
+    header_like = (
+        "facility id", "facility no.", "rpa name", "predom", "ccn", "prv ($k)",
+        "work type", "quantity", "um", "mdi", "cond rtg", "conf rtg", "mtd", "yr blt",
+    )
+    return t in header_like or (len(t) < 20 and any(h in t for h in header_like))
+
+
+def is_valid_facility_row(row: Dict[str, str]) -> bool:
+    """
+    Return False for rows that are clearly junk: misaligned data, row indices,
+    mostly empty rows, or header-like content in data fields.
+    """
+    fid = (row.get("Facility ID") or "").strip()
+    rpa = (row.get("RPA Name") or "").strip()
+    non_empty_count = sum(1 for v in row.values() if (v or "").strip())
+
+    # Reject almost entirely empty rows (e.g. only one small number)
+    if non_empty_count <= 1 and (not fid or len(fid) <= 2):
+        return False
+
+    # Reject rows where Facility ID looks like a row index (1–3 digits)
+    if fid and not _looks_like_facility_id(fid):
+        # Allow row only if it has substantial other data and could be continuation (rare)
+        if non_empty_count <= 2 and _rpa_name_looks_numeric(rpa):
+            return False
+        if non_empty_count <= 1:
+            return False
+
+    # RPA Name should not be purely numeric (misplaced Quantity)
+    if _rpa_name_looks_numeric(rpa):
+        return False
+
+    # Reject rows that are entirely header-like tokens
+    if rpa and _is_header_like_cell(rpa):
+        return False
+    if fid and _is_header_like_cell(fid):
+        return False
+
+    # Need at least one real identifier: valid Facility ID or non-empty text RPA Name
+    has_valid_id = _looks_like_facility_id(fid)
+    # RPA Name must be substantive (e.g. "HOUSING WAREHOUSE"); reject 1–2 char fragments like "ME"
+    _RPA_NAME_MIN_LEN = 3
+    has_real_rpa = (
+        rpa
+        and len(rpa) >= _RPA_NAME_MIN_LEN
+        and not _rpa_name_looks_numeric(rpa)
+        and not _is_header_like_cell(rpa)
+    )
+    if not has_valid_id and not has_real_rpa:
+        return False
+
+    return True
+
+
+def filter_valid_facility_rows(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Return only rows that pass is_valid_facility_row."""
+    return [r for r in rows if is_valid_facility_row(r)]
 
 def single_row_parse(region_boxes: List[TextBox]) -> List[Dict[str, str]]:
     """Parse when one block contains both header labels and one row of data (single facility)."""
@@ -532,6 +724,10 @@ def extract_facility_information_table(boxes: List[TextBox]) -> List[Dict[str, s
     region_boxes = get_region_boxes(boxes, page, y_start, y_end)
     if not region_boxes:
         return []
+    # Prefer data-first single block when present (e.g. RM23-0513: one block with data then headers)
+    if _find_data_first_facility_block(region_boxes) is not None:
+        rows = parse_data_first_single_facility(region_boxes)
+        return filter_valid_facility_rows(rows)
     # Detect layout: multi-row if we have several boxes at the same y0 (different x0)
     tol = y_cluster_tolerance()
     y_to_boxes: Dict[float, List[TextBox]] = {}
@@ -541,8 +737,10 @@ def extract_facility_information_table(boxes: List[TextBox]) -> List[Dict[str, s
     same_y_multi = sum(1 for lst in y_to_boxes.values() if len(lst) > 1)
     multi_row_layout = same_y_multi >= 2  # at least 2 rows with multiple cells
     if multi_row_layout:
-        return multi_row_parse(region_boxes)
-    return single_row_parse(region_boxes)
+        rows = multi_row_parse(region_boxes)
+    else:
+        rows = single_row_parse(region_boxes)
+    return filter_valid_facility_rows(rows)
 #________________________________________________________________________________________________________________________
 
 
@@ -590,21 +788,24 @@ def get_pds(boxes:list)->dict:
 
 
 # Example usage:
+'''
 #________________________________________________________________________________________________________________________
-# files = ["docs/project930.pdf", "docs/project942.pdf"]
-# cwd = os.getcwd()
-# file_paths = [os.path.join(cwd, file) for file in files]
+files = ["docs/projects/P1616.pdf", "docs/projects/RM23-0513.pdf"]
+cwd = os.getcwd()
+parent = os.path.dirname(cwd)
+file_paths = [os.path.join(parent, file) for file in files]
 
-# proj930 = FormTextExtractor(file_paths[0]).extract_boxes()
-# proj942 = FormTextExtractor(file_paths[1]).extract_boxes()
+proj1616 = FormTextExtractor(file_paths[0]).extract_boxes()
+projrm23_0513 = FormTextExtractor(file_paths[1]).extract_boxes()
 
-# proj930_txt = get_pds(proj930)
-# proj942_txt = get_pds(proj942)
+proj1616_txt = get_pds(proj1616)
+projrm23_0513_txt = get_pds(projrm23_0513)
 
-# pprint(proj930_txt, width = 100)
-# pprint(proj942_txt, width = 100)
+pprint(proj1616_txt, width = 100)
+pprint(projrm23_0513_txt, width = 100)
+
 #________________________________________________________________________________________________________________________
-
+'''
 
 
 

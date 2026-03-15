@@ -91,6 +91,10 @@ from langchain_community.retrievers import BM25Retriever
 # For Cross-Encoder retrieval
 from sentence_transformers import CrossEncoder
 
+# Cross-Encoder Re-ranking
+from sentence_transformers import CrossEncoder
+cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
 # RAG components
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
@@ -780,6 +784,65 @@ def run_llm_intro(user_msg: str, history: list):
             # Return the LAST mentioned project ID — most recent in conversation
             return all_matches[-1].upper()
         return None
+    
+    # Helper function for hybrid sparse and dense retrieval
+    # Sparse excels with more exact matches of tokens in user prompt, dense excels at finding matches based on semantic meaning
+    def hybrid_retrieve(store, query, k=6, filter_dict = None):
+
+        # Dense retrieval
+        dense_docs = store.similarity_search_with_relevance_scores(
+            query, k=k, filter=filter_dict
+        )
+
+        # Sparse retrieval
+        collection = store._collection.get(include=["documents", "metadatas"])
+        bm25_docs = [
+            Document(page_content = doc, metadata = meta)
+            for doc, meta in zip(collection["documents"], collection["metadatas"])
+        ]
+        sparse_retriever = BM25Retriever.from_documents(documents=bm25_docs)
+        sparse_docs = sparse_retriever.invoke(query)
+
+        # Normalize scores
+        def normalize(arr):
+            arr = np.array(arr)
+            return (arr - arr.min())/(arr.max() - arr.min() + 1e-6)
+        
+        sparse_scores = normalize([1.0] * len(sparse_docs))
+
+        # Fuse scores
+        fused = []
+        for (doc, d_score), s_score in zip(dense_docs, sparse_scores):
+            fused_score = 0.6 * d_score + 0.4 * s_score  # Weight the dense score slightly more than the sparse score
+            fused.append((doc, float(fused_score)))
+        
+        for doc in sparse_docs[len(dense_docs):]:
+            fused.append((doc, 0.4))
+        
+        # Sort and return
+        fused_sorted = sorted(fused, key= lambda x: x[1], reverse = True)
+        return fused_sorted[:k]
+
+    # Cross-Encoder Re-ranking helper function
+    def cross_encoder_rerank(query: str, docs_with_scores: list, top_k: int = 6):
+        '''
+        Input: List of (Doc, score) pairs from hybrid retrieval
+        Returns: List of (Doc, new_score) pairs sorted by cross-encoder relevance
+        '''
+        # Set up query, doc_text pairs
+        pairs = [(query, doc.page_content) for doc, _ in docs_with_scores]
+
+        # Get new scores predicted by the cross-encoder model
+        scores = cross_encoder.predict(pairs)
+
+        # Zip the docs with their new scores
+        reranked = list(zip([doc for doc, _ in docs_with_scores], scores))
+
+        # Sort by score descending
+        reranked_sorted = sorted(reranked, key = lambda x: x[1], reverse = True)
+
+        return [(doc, float(score)) for doc, score in reranked_sorted[:top_k]]
+
 
     def semantic_retrieve_w_scores(state: dict) -> dict:
         logger.info("NODE: Semantic Retrieve - Starting retrieval")
@@ -856,11 +919,20 @@ def run_llm_intro(user_msg: str, history: list):
         for store in stores:
             filt = filter_dict if store is proj_vectorstore else None
             logger.info(f"  Querying store with filter: {filt}")
-            docs = store.similarity_search_with_relevance_scores(
-                retrieval_query, k=k, filter=filt
+            docs = hybrid_retrieve(
+                store = store,
+                query = retrieval_query,
+                k=k*3,                         # Get a larger pool of candidate docs to be reranked
+                filter_dict = filt
             )
-            logger.info(f"  Got {len(docs)} docs from store")
-            all_docs.extend(docs)
+            logger.info(f"  Hybrid retrieved {len(docs)} docs from store")
+
+            reranked_docs = cross_encoder_rerank(
+                query = retrieval_query,
+                docs_with_scores=docs,
+                top_k=k                       # Rerank and keep the top k
+            )
+            all_docs.extend(reranked_docs)
 
         return {"documents": all_docs}
 

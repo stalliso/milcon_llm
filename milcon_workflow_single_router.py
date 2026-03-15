@@ -38,7 +38,7 @@ from tqdm import tqdm
 from typing_extensions import NotRequired, TypedDict
 
 # OpenAI
-from openai import AsyncOpenAI, OpenAI
+from openai import APIConnectionError, AsyncOpenAI, OpenAI
 
 # LangChain
 from langchain_chroma import Chroma
@@ -115,6 +115,9 @@ strat26_vectorstore = load_vectorstore(strat26_vectorstore_path, embedding_funct
 
 strat28_vectorstore_path: str = "./databases/strat28"
 strat28_vectorstore = load_vectorstore(strat28_vectorstore_path, embedding_function=baseline_hfe)
+
+# Cross-encoder for reranking (hybrid retrieval + rerank)
+cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 #____________________________________________________________________________________________________________________________________________________
 
 # INITIALIZE LLMS:
@@ -123,24 +126,30 @@ strat28_vectorstore = load_vectorstore(strat28_vectorstore_path, embedding_funct
 API_KEY = "sk-UtrV9i5fFenmG6hvMss71A"
 BASE_URL = "http://trac-malenia.ern.nps.edu:8080/inference/v1"
 
+# Fallback when endpoint is unreachable (e.g. offline, no VPN)
+DEFAULT_MODEL_IDS = ["meta/llama-3.2-3b-instruct", "meta/llama-3.2-3b-instruct", "meta/llama-3.2-3b-instruct"]
+
 # Check the models available
 model_ids = []
 
 try:
     response = requests.get(
         f"{BASE_URL}/models",
-        headers={"Authorization": f"Bearer {API_KEY}"}
+        headers={"Authorization": f"Bearer {API_KEY}"},
+        timeout=10,
     )
-    response.raise_for_status()  
+    response.raise_for_status()
     info = response.json()
-    
-    for model in info['data']:
-        model_ids.append(model['id'])
-    model_id = info['data'][0]['id']
+    for model in info["data"]:
+        model_ids.append(model["id"])
     print(f"Available Models: {model_ids}")
-    # print(f"\nDefault Selected Model Id: {model_id}")
 except Exception as e:
     print(f"Error accessing model endpoint: {e}")
+    print("  (If models are on NPS campus, check VPN/network and that trac-malenia.ern.nps.edu is reachable.)")
+
+if len(model_ids) < 3:
+    model_ids = DEFAULT_MODEL_IDS.copy()
+    print(f"Using fallback model IDs: {model_ids}")
 
 model_id = model_ids[2]
 
@@ -348,47 +357,213 @@ def route_question_node(state: dict) -> dict:
 
 # Build the retrieval node
 def extract_project_id(question: str) -> str | None:
-    match = re.search(r'\b(P\d{3,4}|RM\d{2}-\d{4}|NF\d{2}-\d{4}|ST\d{2}-\d{4})\b', question)
-    return match.group(0) if match else None
+    match = re.search(
+        r'\b(P\d{3,4}|RM\d{2}-\d{4}|NF\d{2}-\d{4}|ST\d{2}-\d{4}|B\d{3,4})\b',
+        question,
+        re.IGNORECASE
+    )
+    return match.group(0).upper() if match else None
+
+
+# Constants for is_aggregate_query (used to avoid resolving project from history on aggregate questions)
+AGGREGATE_KEYWORDS = [
+    "how many", "count", "total cost", "total amount", "total cwe", "combined cost",
+    "sum of", "list all", "show all", "all projects", "which projects", "average cost",
+    "avg cost", "projects in", "projects across",
+]
+SPECIFIC_PROJECT_PATTERNS = [
+    r'\b(P\d{3,4}|RM\d{2}-\d{4}|NF\d{2}-\d{4}|ST\d{2}-\d{4}|B\d{3,4})\b',
+]
+NARRATIVE_KEYWORDS = [
+    "justification", "justify", "explain", "why", "how does", "align with", "strategy",
+    "strategic", "guidance", "scope", "impact", "description", "what is the",
+    "tell me about", "summarize",
+]
+
+
+def is_aggregate_query(question: str) -> bool:
+    """Return True only for dataset-wide summary/count/filter queries."""
+    if "Current question:" in question:
+        q = question.split("Current question:")[-1].strip().lower()
+    else:
+        q = question.lower()
+    for pattern in SPECIFIC_PROJECT_PATTERNS:
+        if re.search(pattern, q, re.IGNORECASE):
+            return False
+    if any(kw in q for kw in NARRATIVE_KEYWORDS):
+        return False
+    return any(kw in q for kw in AGGREGATE_KEYWORDS)
+
+
+def extract_project_id_from_history(question: str) -> str | None:
+        """
+        Extract project ID from conversation history when current question
+        uses a pronoun like 'it', 'this project', 'the project' without naming it.
+        Scans the full enriched question string (which includes history) for the
+        most recently mentioned project ID.
+        """
+        # Find ALL project IDs mentioned anywhere in the full question string
+        # (which includes conversation history when enriched)
+        all_matches = re.findall(
+            r'\b(P\d{3,4}|RM\d{2}-\d{4}|NF\d{2}-\d{4}|ST\d{2}-\d{4}|B\d{3,4})\b',
+            question,
+            re.IGNORECASE
+        )
+        if all_matches:
+            # Return the LAST mentioned project ID — most recent in conversation
+            return all_matches[-1].upper()
+        return None
+        
+# Helper function for hybrid sparse and dense retrieval
+# Sparse excels with more exact matches of tokens in user prompt, dense excels at finding matches based on semantic meaning
+def hybrid_retrieve(store, query, k=6, filter_dict = None):
+
+    # Dense retrieval
+    dense_docs = store.similarity_search_with_relevance_scores(
+        query, k=k, filter=filter_dict
+    )
+
+    # Sparse retrieval
+    collection = store._collection.get(include=["documents", "metadatas"])
+    bm25_docs = [
+        Document(page_content = doc, metadata = meta)
+        for doc, meta in zip(collection["documents"], collection["metadatas"])
+    ]
+    sparse_retriever = BM25Retriever.from_documents(documents=bm25_docs)
+    sparse_docs = sparse_retriever.invoke(query)
+
+    # Normalize scores
+    def normalize(arr):
+        arr = np.array(arr)
+        return (arr - arr.min())/(arr.max() - arr.min() + 1e-6)
+    
+    sparse_scores = normalize([1.0] * len(sparse_docs))
+
+    # Fuse scores
+    fused = []
+    for (doc, d_score), s_score in zip(dense_docs, sparse_scores):
+        fused_score = 0.6 * d_score + 0.4 * s_score  # Weight the dense score slightly more than the sparse score
+        fused.append((doc, float(fused_score)))
+    
+    for doc in sparse_docs[len(dense_docs):]:
+        fused.append((doc, 0.4))
+    
+    # Sort and return
+    fused_sorted = sorted(fused, key= lambda x: x[1], reverse = True)
+    return fused_sorted[:k]
+
+# Cross-Encoder Re-ranking helper function
+def cross_encoder_rerank(query: str, docs_with_scores: list, top_k: int = 6):
+    '''
+    Input: List of (Doc, score) pairs from hybrid retrieval
+    Returns: List of (Doc, new_score) pairs sorted by cross-encoder relevance
+    '''
+    # Set up query, doc_text pairs
+    pairs = [(query, doc.page_content) for doc, _ in docs_with_scores]
+
+    # Get new scores predicted by the cross-encoder model
+    scores = cross_encoder.predict(pairs)
+
+    # Zip the docs with their new scores
+    reranked = list(zip([doc for doc, _ in docs_with_scores], scores))
+
+    # Sort by score descending
+    reranked_sorted = sorted(reranked, key = lambda x: x[1], reverse = True)
+
+    return [(doc, float(score)) for doc, score in reranked_sorted[:top_k]]
+
 
 def semantic_retrieve_w_scores(state: dict) -> dict:
-    routes = state.get("routes", [])
-    query = state["question"]
-    k = state.get("k", 6)
-    project_id = extract_project_id(query)
-    filter_dict = {"project_id": project_id} if project_id else None
+        logger.info("NODE: Semantic Retrieve - Starting retrieval")
+        routes = state.get("routes", [])
+        full_question = state["question"]
+        k = state.get("k", 6)
 
-     # Map route names to actual vectorstores
-    store_map = {
-        "proj_vectorstore": proj_vectorstore,
-        "strat26_vectorstore": strat26_vectorstore,
-        "strat28_vectorstore": strat28_vectorstore 
-    }
+        if "Current question:" in full_question:
+            retrieval_query = full_question.split("Current question:")[-1].strip()
+        else:
+            retrieval_query = full_question
 
-    # Build list of actual stores to query
-    stores = [store_map[r] for r in routes if r in store_map]
+        # Resolve project ID BEFORE any query rewrite
+        # so pronoun references ("it", "the project") are resolved from history
+        project_id = extract_project_id(retrieval_query)
 
-    if not stores:
-        return {"documents": []}
+        PRONOUN_REFS = ["it ", "its ", "this project", "the project", "how does it", "how would it"]
+        is_pronoun_ref = any(p in retrieval_query.lower() for p in PRONOUN_REFS)
 
-    all_docs = []
+        if not project_id and is_pronoun_ref and not is_aggregate_query(full_question):
+            project_id = extract_project_id_from_history(full_question)
+            if project_id:
+                logger.info(f"  project_id resolved from history: {project_id}")
 
-    for store in stores:
-        # Only apply project_id filter to the project vectorstore
-        filt = filter_dict if store is proj_vectorstore else None
+        # If a project was resolved (either directly or from history),
+        # make sure proj_vectorstore is in routes
+        if project_id and "proj_vectorstore" not in routes:
+            routes = list(routes) + ["proj_vectorstore"]
+            logger.info(f"  Safety net: added proj_vectorstore for {project_id}")
 
-        docs = store.similarity_search_with_relevance_scores(
-            query,
-            k=k,
-            filter=filt
-        )
-        all_docs.extend(docs)
+        # NOW apply query rewrite for NSS/NDS — after project ID is resolved
+        # NOW apply query rewrite for NSS/NDS — after project ID is resolved
+        q_lower = retrieval_query.lower()
+        full_q_lower = full_question.lower()
 
-    # Sort combined results by score descending
-    all_docs.sort(key=lambda x: x[1], reverse=True)
+        # Determine which POM era is being asked about
+        is_pom28_context = any(kw in q_lower for kw in [
+            "pom28", "pom 28", "updated", "new guidance", "updated guidance"
+        ]) or any(kw in full_q_lower.split("current question:")[-1].lower() for kw in [
+            "pom28", "pom 28"
+        ])
 
-    logger.info(f"Retrieved {len(all_docs)} documents across {len(stores)} stores")
-    return {"documents": all_docs}
+        if any(kw in q_lower for kw in ["nss", "national security strategy"]):
+            if is_pom28_context:
+                retrieval_query = "2025 national security strategy america first priorities strength deterrence"
+                logger.info("  NSS query rewrite applied (POM28 context)")
+            else:
+                retrieval_query = "national security strategy priorities competition democracy alliances"
+                logger.info("  NSS query rewrite applied (POM26 context)")
+        elif any(kw in q_lower for kw in ["nds", "national defense strategy"]):
+            if is_pom28_context:
+                retrieval_query = "2026 national defense strategy military strength deterrence homeland"
+                logger.info("  NDS query rewrite applied (POM28 context)")
+            else:
+                retrieval_query = "national defense strategy military deterrence threats integrated"
+                logger.info("  NDS query rewrite applied (POM26 context)")
+
+        filter_dict = {"project_id": {"$eq": project_id}} if project_id else None
+        logger.info(f"  project_id: {project_id}, filter: {filter_dict}")
+
+        store_map = {
+            "proj_vectorstore": proj_vectorstore,
+            "strat26_vectorstore": strat26_vectorstore,
+            "strat28_vectorstore": strat28_vectorstore
+        }
+
+        stores = [store_map[r] for r in routes if r in store_map]
+        logger.info(f"  Stores to query: {[r for r in routes if r in store_map]}")
+
+        if not stores:
+            return {"documents": []}
+
+        all_docs = []
+        for store in stores:
+            filt = filter_dict if store is proj_vectorstore else None
+            logger.info(f"  Querying store with filter: {filt}")
+            docs = hybrid_retrieve(
+                store = store,
+                query = retrieval_query,
+                k=k*3,                         # Get a larger pool of candidate docs to be reranked
+                filter_dict = filt
+            )
+            logger.info(f"  Hybrid retrieved {len(docs)} docs from store")
+
+            reranked_docs = cross_encoder_rerank(
+                query = retrieval_query,
+                docs_with_scores=docs,
+                top_k=k                       # Rerank and keep the top k
+            )
+            all_docs.extend(reranked_docs)
+
+        return {"documents": all_docs}
 
 semantic_retriever = RunnableLambda(
     semantic_retrieve_w_scores,
@@ -588,19 +763,83 @@ workflow.add_conditional_edges("check_answer",
 app = workflow.compile()
 
 #____________________________________________________________________________________________________________________________________________________
+# UPFRONT HEALTH CHECK (NPS API reachable before running eval)
+#____________________________________________________________________________________________________________________________________________________
+def check_nps_api_reachable() -> tuple[bool, str]:
+    """Returns (success, message). Call before eval to avoid failing on first question."""
+    try:
+        r = requests.get(
+            f"{BASE_URL}/models",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if data.get("data") and len(data["data"]) > 0:
+            return True, "NPS API reachable (models endpoint OK)."
+        return False, "NPS API returned no models."
+    except requests.exceptions.Timeout:
+        return False, "NPS API timeout (no response within 15s)."
+    except requests.exceptions.ConnectionError as e:
+        return False, f"NPS API unreachable: {e}"
+    except Exception as e:
+        return False, f"NPS API check failed: {e}"
+
+api_ok, api_msg = check_nps_api_reachable()
+print(api_msg)
+if not api_ok:
+    print("  Check VPN/network and that trac-malenia.ern.nps.edu is reachable.")
+    sys.exit(1)
+
+#____________________________________________________________________________________________________________________________________________________
 # EVALUATE:
 #____________________________________________________________________________________________________________________________________________________
+# Retry on transient server disconnects (campus network hiccups, NPS server load)
+MAX_LLM_RETRIES = 5
+RETRY_BASE_DELAY_SEC = 10  # exponential backoff: 10s, 20s, 40s, 80s
+
+
+def _invoke_app_with_retry(question: str) -> str:
+    last_err = None
+    for attempt in range(MAX_LLM_RETRIES):
+        try:
+            return app.invoke({"question": question, "k": 6})["generation"]
+        except APIConnectionError as e:
+            last_err = e
+            logging.warning("APIConnectionError on question=%r (attempt %d/%d): %s",
+            question[:80], attempt + 1, MAX_LLM_RETRIES, e)
+            if attempt == MAX_LLM_RETRIES - 1:
+                raise
+            delay = RETRY_BASE_DELAY_SEC * (2**attempt)
+            logging.warning(
+                "API connection error (attempt %d/%d), retrying in %ds...",
+                attempt + 1, MAX_LLM_RETRIES, delay
+            )
+            time.sleep(delay)
+        except Exception as e:
+            if "RemoteProtocolError" in type(e).__name__ or "disconnected" in str(e).lower():
+                last_err = e
+                if attempt == MAX_LLM_RETRIES - 1:
+                    raise
+                delay = RETRY_BASE_DELAY_SEC * (2**attempt)
+                logging.warning(
+                    "Server disconnected (attempt %d/%d), retrying in %ds...",
+                    attempt + 1, MAX_LLM_RETRIES, delay
+                )
+                time.sleep(delay)
+            else:
+                raise
+    raise last_err
+
 # Wrap app.invoke to match the expected interface (takes string, returns string)
-agent_as_chain = RunnableLambda(
-    lambda question: app.invoke({"question": question, "k": 6})["generation"]
-)
+agent_as_chain = RunnableLambda(_invoke_app_with_retry)
 
 # Suppress debug logging during eval
 logging.getLogger("agentic_workflow").setLevel(logging.WARNING)
 warnings.filterwarnings("ignore", category=UserWarning)
 
-num_qa_runs    = 1
-num_multi_runs = 1
+num_qa_runs    = 10
+num_multi_runs = 10
 
 def run_qa(_):
     # now returns (accuracy, missed_questions)
@@ -609,7 +848,8 @@ def run_qa(_):
 def run_multi(_):
     return eval_multi_part_routing(app, k=6, verbose=False)
 
-with ThreadPoolExecutor(max_workers=8) as executor:
+# Use 2 workers so QA and multi-part can run together without overloading NPS API
+with ThreadPoolExecutor(max_workers=1) as executor:
     qa_futures    = {executor.submit(run_qa,    i): i for i in range(num_qa_runs)}
     multi_futures = {executor.submit(run_multi, i): i for i in range(num_multi_runs)}
 

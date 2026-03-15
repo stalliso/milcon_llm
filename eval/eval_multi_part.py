@@ -190,7 +190,8 @@ def eval_multi_part_routing(app, k=6, verbose=False):
             "generation": generation,
         }
 
-    with ThreadPoolExecutor() as executor:
+    # Limit concurrency to avoid overwhelming campus NPS API
+    with ThreadPoolExecutor(max_workers=2) as executor:
         results = dict(executor.map(run_one, MULTI_PART_QUESTIONS.items()))
 
     if verbose:

@@ -282,7 +282,8 @@ def eval_rag_chain_proj_query(my_rag_chain, q_num=15, verbose=False):
             "correct":  correct,
         }
 
-    with ThreadPoolExecutor() as executor:
+    # Limit concurrency to avoid overwhelming campus NPS API (default would be many workers)
+    with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(executor.map(score_one, q_a_pairs_rand))
 
     correct_count = sum(r["correct"] for r in results)
