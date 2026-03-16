@@ -325,7 +325,7 @@ def run_llm_intro(user_msg: str, history: list):
         reasoning : short explanation of the routing decision (for debugging)
         """
         routes: List[Literal["proj_vectorstore", "strat26_vectorstore", "strat28_vectorstore"]]
-        answer_strategy: Literal["pandas_aggregate", "semantic_rag"]
+        answer_strategy: Literal["pandas_aggregate", "pandas_list", "semantic_rag"]
         retrieval_query: str
         reasoning: str
 
@@ -386,16 +386,33 @@ Choose exactly one:
   • "pandas_aggregate"  — use this when the question asks for:
         - Counts, totals, sums, or averages ACROSS multiple projects
           (e.g. "how many projects in Italy", "total cost of all projects in Greece and Spain")
-        - Lists or rankings of projects matching a filter
+        - Lists or rankings of projects matching a CONCRETE filter
           (e.g. "list all projects with mission alignment score of 4",
-                "which projects are in Spain?", "show all projects under CCN 14380")
-        - Dataset-wide comparisons or summaries
+                "which projects are in Spain?", "show all projects under CCN 14380",
+                "list all Italy projects with their prices")
+        - Dataset-wide comparisons or summaries based on existing data columns
+        Do NOT use this if the question is about a single named project.
+        Do NOT use this if the question requires qualitative reasoning or interpretation.
+
+  • "pandas_list"       — use this when the question asks for a list of projects AND
+        the answer requires filtering on existing data columns PLUS a brief explanation
+        per project drawn from the data. Examples:
+          - "which projects have a low readiness score and why"
+          - "what projects have the weakest justification" (filter low scores, explain desc)
+          - "list projects in Italy with poor severity scores and explain"
+        The output should be a bulleted list with a brief explanation per project.
+        Do NOT use this for simple column-filter queries — those are pandas_aggregate.
+        Do NOT use this if answering requires reasoning about strategy or policy
+        (e.g. "what projects would score worse under POM28") — that is semantic_rag.
         Do NOT use this if the question is about a single named project.
 
   • "semantic_rag"      — use this for everything else:
         - Narrative questions about a specific project (scope, justification, impact)
         - Strategy/policy alignment questions
         - Re-scoring or estimating scores under POM28
+        - Questions that require reasoning about how strategic themes affect scoring,
+          even across multiple projects — e.g. "what projects would score worse under
+          POM28 guidance", "which project types benefit most from POM28 themes"
         - "How does P740 align with...", "What is the scope of RM23-0514", etc.
 
 ────────────────────────────────────────────────────────────
@@ -676,6 +693,74 @@ This is used only for debugging.
             logger.error(f"  Pandas exec error: {e}\nCode:\n{code}")
 
         logger.info(f"  Pandas result: {result_str[:200]}")
+        return {"generation": result_str}
+    
+    def pandas_list_node(state: dict) -> dict:
+        logger.info("NODE: Pandas List Query")
+        question = state["question"]
+
+        # Extract current question only
+        if "Current question:" in question:
+            current_q = question.split("Current question:")[-1].strip()
+        else:
+            current_q = question
+
+        schema_info = f"""
+        You have access to a pandas DataFrame called proj_df with {len(proj_df)} rows.
+
+        ACTUAL columns: {list(proj_df.columns)}
+
+        KEY COLUMN NOTES:
+        - 'installation': ends in country code (' IT'=Italy, ' GR'=Greece, ' SP'=Spain)
+        - 'CWE': cost in THOUSANDS of dollars
+        - Score columns end in '_score' (integers, -1 = not provided, use region_ by default)
+        - Description columns end in '_desc' (plain text, never apply int() to these)
+        - ALL column names are case-sensitive
+        """
+
+        code_prompt = (
+            schema_info
+            + '\n\nWrite Python/pandas code to answer this question: "'
+            + current_q
+            + '''"\n\nRULES:
+                - Filter proj_df to the relevant projects using pandas
+                - Set result as a plain text BULLETED LIST string (use "• " prefix for each item)
+                - Each bullet must include: Project ID, Title, and a 1-2 sentence explanation
+                of why that project meets the criteria in the question
+                - Base explanations on actual data from the row fields (scope, score columns,
+                description columns, installation, CWE, etc.) — do not invent information
+                - Do NOT build a DataFrame or markdown table — result must be a plain string
+                - Do NOT import anything — pandas is available as pd
+                - Do NOT define any functions — use direct pandas operations only
+                - Output ONLY the code, no explanation, no markdown fences
+
+                EXAMPLE FORMAT:
+                    filtered = proj_df[some_mask]
+                    result = ""
+                    for _, row in filtered.iterrows():
+                        pid   = row["project_id"]
+                        title = row.get("title", "N/A")
+                        score = row.get("region_mission_alignment_score", -1)
+                        desc  = row.get("region_mission_alignment_desc", "")
+                        result += f"• {pid} — {title}: Region mission alignment score is {score}. {desc[:1000]}...\\n\\n"
+                    if not result:
+                        result = "No projects found matching that criteria."
+                '''
+                        )
+
+        response = llm_gen_tools.invoke([{"role": "user", "content": code_prompt}])
+        code = response.content.strip().removeprefix("```python").removeprefix("```").removesuffix("```").strip()
+        logger.debug(f"  Generated pandas list code:\n{code}")
+
+        local_vars = {"proj_df": proj_df.copy(), "pd": pd, "json": json}
+        try:
+            exec(code, local_vars)
+            result_str = str(local_vars.get("result", "Could not compute result."))
+        except Exception as e:
+            result_str = f"Error running that query: `{e}`"
+            logger.error(f"  Pandas list exec error: {e}\nCode:\n{code}")
+
+        logger.info(f"  Pandas list result preview: {result_str[:200]}")
         return {"generation": result_str}
 
     # ------------------------------------------------------------------
@@ -1045,6 +1130,7 @@ Question: {query}
     workflow.add_node("init_state",                    init_graph_state)
     workflow.add_node("route_question",                route_question_node)
     workflow.add_node("pandas_aggregate",              pandas_query_node)
+    workflow.add_node("pandas_list",                   pandas_list_node)
     workflow.add_node("semantic_retriever_and_grader", semantic_retrieve_w_scores)
     workflow.add_node("generate_response",             generate_response)
     workflow.add_node("check_answer",                  check_answer_node)
@@ -1057,11 +1143,13 @@ Question: {query}
         route_question_edge,
         {
             "pandas_aggregate": "pandas_aggregate",
+            "pandas_list":      "pandas_list",
             "semantic_rag":     "semantic_retriever_and_grader",
         }
     )
 
-    workflow.add_edge("pandas_aggregate",              END)
+    workflow.add_edge("pandas_aggregate", END)
+    workflow.add_edge("pandas_list",      END)
     workflow.add_edge("semantic_retriever_and_grader", "generate_response")
     workflow.add_edge("generate_response",             "check_answer")
 
@@ -1170,7 +1258,8 @@ else:
                     except Exception as e:
                         st.markdown(f"Error rendering table: `{e}`")
                 else:
-                    st.markdown(assistant_reply)
+                    # Ensure bullet points each render on their own line
+                    st.markdown(assistant_reply.replace("\n•", "\n\n•"))
 
                 # Show sources in collapsible expander
                 if source_docs:
